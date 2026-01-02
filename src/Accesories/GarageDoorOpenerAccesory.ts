@@ -19,7 +19,7 @@ export class GarageDoorOpenerAccesory {
         this.service = this.accessory.getService(this.platform.Service.GarageDoorOpener)
             || this.accessory.addService(this.platform.Service.GarageDoorOpener);
 
-        this.service.setCharacteristic(this.platform.Characteristic.Name, accessory.context.device.displayName);
+        this.service.setCharacteristic(this.platform.Characteristic.Name, accessory.displayName);
 
         this.service.getCharacteristic(this.platform.Characteristic.CurrentDoorState)
           .onGet(this.handleCurrentDoorStateGet.bind(this));

@@ -20,7 +20,7 @@ export class DimmerAccessory {
     this.service = this.accessory.getService(this.platform.Service.Lightbulb)
       || this.accessory.addService(this.platform.Service.Lightbulb);
 
-    this.service.setCharacteristic(this.platform.Characteristic.Name, accessory.context.device.displayName);
+    this.service.setCharacteristic(this.platform.Characteristic.Name, accessory.displayName);
 
     this.service.getCharacteristic(this.platform.Characteristic.On)
       .onGet(this.handleOnGet.bind(this))

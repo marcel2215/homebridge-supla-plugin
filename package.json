@@ -9,7 +9,7 @@
     "url": "https://github.com/Kamilolek/HomebridgeSuplaPlugin.git"
   },
   "engines": {
-    "node": "^18.17.0 || ^20.9.0",
+    "node": "^18.17.0 || ^20.9.0 || ^24.0.0",
     "homebridge": "^1.6.0"
   },
   "main": "dist/index.js",

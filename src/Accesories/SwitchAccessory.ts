@@ -1,0 +1,51 @@
+import { Service, PlatformAccessory, CharacteristicValue } from 'homebridge';
+import { SuplaPlatform } from '../platform';
+import { SuplaChannelContext } from '../Heplers/SuplaChannelContext';
+
+export class SwitchAccessory {
+  private service: Service;
+  private state = false;
+
+  constructor(
+    private readonly platform: SuplaPlatform,
+    private readonly accessory: PlatformAccessory,
+    private readonly context: SuplaChannelContext,
+  ) {
+    this.accessory.getService(this.platform.Service.AccessoryInformation)!
+      .setCharacteristic(this.platform.Characteristic.Manufacturer, 'Supla')
+      .setCharacteristic(this.platform.Characteristic.Model, 'SwitchController');
+
+    this.service = this.accessory.getService(this.platform.Service.Switch)
+      || this.accessory.addService(this.platform.Service.Switch);
+
+    this.service.setCharacteristic(this.platform.Characteristic.Name, accessory.displayName);
+
+    this.service.getCharacteristic(this.platform.Characteristic.On)
+      .onGet(this.handleOnGet.bind(this))
+      .onSet(this.handleOnSet.bind(this));
+
+    setTimeout(() => {
+      this.platform.MqttClient.client.subscribe(`${this.context.topic}/state/on`);
+      this.platform.MqttClient.client.on('message', (topic, message) => {
+        if (topic === `${this.context.topic}/state/on`) {
+          this.state = message.toString() === 'true';
+          this.service.updateCharacteristic(this.platform.Characteristic.On, this.state);
+        }
+      });
+    }, 3000);
+  }
+
+  async handleOnGet(): Promise<CharacteristicValue> {
+    return this.state;
+  }
+
+  async handleOnSet(value: CharacteristicValue) {
+    this.platform.MqttClient.client.publish(
+      `${this.context.topic}/set/on`,
+      value.toString(),
+    );
+    setTimeout(() => {
+      this.service.updateCharacteristic(this.platform.Characteristic.On, this.state);
+    }, 300);
+  }
+}

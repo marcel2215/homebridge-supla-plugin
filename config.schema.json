@@ -18,6 +18,16 @@
         "type": "string",
         "default": 8883
     },
+    "protocol": {
+      "title": "Protocol",
+      "type": "string",
+      "default": "mqtt"
+    },
+    "tls": {
+      "title": "TLS",
+      "type": "boolean",
+      "default": true
+    },
     "username": {
       "title": "Username",
       "type": "string",
@@ -27,6 +37,11 @@
       "title": "Password",
       "type": "string",
       "default": "admin"
+    },
+    "channels": {
+      "title": "Cached Channels",
+      "type": "string",
+      "default": "[]"
     }
   }
 }

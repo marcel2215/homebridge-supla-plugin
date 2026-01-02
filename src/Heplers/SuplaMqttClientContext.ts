@@ -4,6 +4,8 @@ export class SuplaMqttClientContext {
     public port: number,
     public username: string,
     public password: string,
+    public protocol?: string,
+    public tls?: boolean | string,
   ) {
   }
 }

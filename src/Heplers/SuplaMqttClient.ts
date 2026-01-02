@@ -5,8 +5,6 @@ import {SuplaChannelContext} from './SuplaChannelContext';
 
 export class SuplaMqttClient {
   public client: MqttClient;
-  // eslint-disable-next-line max-len
-  private allowedChanelFunctions = ['CONTROLLINGTHEGARAGEDOOR', 'CONTROLLINGTHEGATE', 'LIGHTSWITCH', 'CONTROLLINGTHEGATEWAYLOCK', 'RGBLIGHTING', 'DIMMER'];
   constructor(
     private readonly context : SuplaMqttClientContext,
     private readonly log : Logger) {
@@ -14,9 +12,10 @@ export class SuplaMqttClient {
       username: context.username,
       password: context.password,
     };
-    this.client = mqtt.connect(`mqtts://${context.host}:${context.port}`, options);
+    const protocol = this.resolveProtocol();
+    this.client = mqtt.connect(`${protocol}://${context.host}:${context.port}`, options);
 
-    this.client.setMaxListeners(20);
+    this.client.setMaxListeners(0);
 
     this.client.on('connect', () => {
       this.log.info('MQTT client connected');
@@ -24,60 +23,116 @@ export class SuplaMqttClient {
   }
 
   public async discoverChannelsAsync() : Promise<Array<SuplaChannelContext>> {
-    this.client.subscribe('#', (err) => {
+    const subscriptionTopic = `supla/${this.context.username}/devices/+/channels/#`;
+    const channelMap = new Map<string, {
+      deviceId: string;
+      channelId: string;
+      channelType?: string;
+      channelFunction?: string;
+      channelCaption?: string;
+      hidden?: string | boolean;
+    }>();
+    let resolveDone: (() => void) | undefined;
+    const discoveryDone = new Promise<void>((resolve) => {
+      resolveDone = resolve;
+    });
+    let quietTimer: NodeJS.Timeout | undefined;
+    const maxWaitMs = 4000;
+    const quietWindowMs = 1000;
+    const maxTimer = setTimeout(() => resolveDone?.(), maxWaitMs);
+    const messageHandler = (topic: string, message: Buffer) => {
+      const match = topic.match(
+        new RegExp(`^supla/${this.context.username}/devices/(\\d+)/channels/(\\d+)/(.*)$`),
+      );
+      if (!match) {
+        return;
+      }
+      const [, deviceId, channelId, suffix] = match;
+      const key = `${deviceId}:${channelId}`;
+      const entry = channelMap.get(key) ?? {deviceId, channelId};
+      const value = message.toString();
+      switch (suffix) {
+        case 'type':
+          entry.channelType = value;
+          break;
+        case 'function':
+          entry.channelFunction = value;
+          break;
+        case 'caption':
+          entry.channelCaption = value;
+          break;
+        case 'hidden':
+          entry.hidden = value;
+          break;
+        default:
+          break;
+      }
+      channelMap.set(key, entry);
+      if (quietTimer) {
+        clearTimeout(quietTimer);
+      }
+      quietTimer = setTimeout(() => resolveDone?.(), quietWindowMs);
+    };
+
+    this.client.subscribe(subscriptionTopic, (err) => {
+      if (err) {
+        this.log.error(err.message);
+        resolveDone?.();
+      }
+    });
+    this.client.on('message', messageHandler);
+    await discoveryDone;
+    clearTimeout(maxTimer);
+    if (quietTimer) {
+      clearTimeout(quietTimer);
+    }
+    this.client.removeListener('message', messageHandler);
+    this.client.unsubscribe(subscriptionTopic, (err) => {
       if (err) {
         this.log.error(err.message);
       }
     });
-    const topics : Array<{topic : string; message : string}> = [];
-    let process = true;
-    this.client.on('message', (topic, message) => {
-      topics.push({topic, message: message.toString()});
-      // eslint-disable-next-line prefer-const
-      let timer;
-      clearTimeout(timer);
-      timer = setTimeout(() => {
-        this.client.unsubscribe('#', (err) => {
-          if (err) {
-            this.log.error(err.message);
-          } else {
-            process = false;
-          }
-        });
-      }, 1000);
-    });
-    while(process) {
-      await new Promise(resolve => setTimeout(resolve, 50));
-    }
-    const channels : Array<{channelId : string; deviceId : string}> = [];
-    topics.forEach((message) => {
-      const matches = message.topic.match(/.*\/([0-9]*)\/channels\/([0-9]*)\/.*/);
-      if (matches
-        && channels.map((channel) => channel.channelId).indexOf(matches[2]) === -1) {
-        channels.push({channelId: matches[2], deviceId: matches[1]});
-      }
-    });
+
     const result : Array<SuplaChannelContext> = [];
-    channels.forEach((channel) => {
-      const channelType = topics.find((topic) =>
-        // eslint-disable-next-line max-len
-        topic.topic === `supla/${this.context.username}/devices/${channel.deviceId}/channels/${channel.channelId}/type`)?.message ?? 'unknown';
-      const channelFunction = topics.find((topic) =>
-        // eslint-disable-next-line max-len
-        topic.topic === `supla/${this.context.username}/devices/${channel.deviceId}/channels/${channel.channelId}/function`)?.message ?? 'unknown';
-      const caption = topics.find((topic) =>
-        // eslint-disable-next-line max-len
-        topic.topic === `supla/${this.context.username}/devices/${channel.deviceId}/channels/${channel.channelId}/caption`)?.message ?? 'unknown';
-      const hidden = topics.find((topic) =>
-        // eslint-disable-next-line max-len
-        topic.topic === `supla/${this.context.username}/devices/${channel.deviceId}/channels/${channel.channelId}/hidden`)?.message ?? 'unknown';
-      const topic = `supla/${this.context.username}/devices/${channel.deviceId}/channels/${channel.channelId}`;
-      if (this.allowedChanelFunctions.indexOf(channelFunction) === -1 || hidden === 'true') {
-        return;
+    for (const entry of channelMap.values()) {
+      const hiddenValue = entry.hidden ?? 'false';
+      const hidden = typeof hiddenValue === 'string'
+        ? hiddenValue.toLowerCase() === 'true'
+        : Boolean(hiddenValue);
+      if (hidden) {
+        continue;
       }
-      result.push(new SuplaChannelContext(topic, channelType, channelFunction, caption));
-    });
+      const channelType = entry.channelType ?? 'UNKNOWN';
+      const channelFunction = entry.channelFunction ?? 'UNKNOWN';
+      const caption = entry.channelCaption ?? `Device ${entry.deviceId} Channel ${entry.channelId}`;
+      const topic = `supla/${this.context.username}/devices/${entry.deviceId}/channels/${entry.channelId}`;
+      result.push(new SuplaChannelContext(
+        topic,
+        channelType,
+        channelFunction,
+        caption,
+        entry.deviceId,
+        entry.channelId,
+      ));
+    }
     return result;
   }
-}
 
+  private resolveProtocol(): string {
+    const rawProtocol = (this.context.protocol ?? '').toString().toLowerCase();
+    const tlsFlag = this.context.tls;
+    const tlsEnabled = typeof tlsFlag === 'string'
+      ? ['1', 'true', 'on', 'yes'].includes(tlsFlag.toLowerCase())
+      : Boolean(tlsFlag);
+    if (!rawProtocol) {
+      return tlsEnabled ? 'mqtts' : 'mqtt';
+    }
+    if (tlsEnabled && rawProtocol === 'mqtt') {
+      return 'mqtts';
+    }
+    if (tlsEnabled && rawProtocol === 'ws') {
+      return 'wss';
+    }
+    return rawProtocol;
+  }
+}

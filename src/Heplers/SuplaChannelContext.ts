@@ -4,6 +4,8 @@ export class SuplaChannelContext {
     public channelType: string,
     public channelFunction: string,
     public channelCaption: string,
+    public deviceId: string,
+    public channelId: string,
   ) {
   }
 }

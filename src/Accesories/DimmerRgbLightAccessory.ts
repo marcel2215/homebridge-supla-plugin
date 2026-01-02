@@ -1,14 +1,15 @@
 import { Service, PlatformAccessory, CharacteristicValue } from 'homebridge';
 import { SuplaPlatform } from '../platform';
-import {HexToRGB, HSVtoRGB, RGBtoHSV, RGBToHex} from '../Heplers/ColorConverters';
-import {SuplaChannelContext} from '../Heplers/SuplaChannelContext';
+import { HexToRGB, HSVtoRGB, RGBtoHSV, RGBToHex } from '../Heplers/ColorConverters';
+import { SuplaChannelContext } from '../Heplers/SuplaChannelContext';
 
-export class RGBLightAccesory {
+export class DimmerRgbLightAccessory {
   private service: Service;
   private state = false;
   private hsv = {h: 0, s: 0, v: 0};
   private rgb = {r: 0, g: 0, b: 0};
-
+  private brightness = 0;
+  private hasDimmerBrightness = false;
 
   constructor(
     private readonly platform: SuplaPlatform,
@@ -17,7 +18,7 @@ export class RGBLightAccesory {
   ) {
     this.accessory.getService(this.platform.Service.AccessoryInformation)!
       .setCharacteristic(this.platform.Characteristic.Manufacturer, 'Supla')
-      .setCharacteristic(this.platform.Characteristic.Model, 'RGBLightController');
+      .setCharacteristic(this.platform.Characteristic.Model, 'DimmerRGBController');
 
     this.service = this.accessory.getService(this.platform.Service.Lightbulb)
       || this.accessory.addService(this.platform.Service.Lightbulb);
@@ -44,7 +45,7 @@ export class RGBLightAccesory {
       this.platform.MqttClient.client.subscribe(`${this.context.topic}/state/on`);
       this.platform.MqttClient.client.subscribe(`${this.context.topic}/state/color`);
       this.platform.MqttClient.client.subscribe(`${this.context.topic}/state/color_brightness`);
-
+      this.platform.MqttClient.client.subscribe(`${this.context.topic}/state/brightness`);
       this.platform.MqttClient.client.on('message', (topic, message) => {
         switch (topic) {
           case `${this.context.topic}/state/on`:
@@ -57,8 +58,16 @@ export class RGBLightAccesory {
             this.updateColor();
             break;
           case `${this.context.topic}/state/color_brightness`:
-            this.hsv.v = parseInt(message.toString());
+            this.hsv.v = parseInt(message.toString(), 10);
+            if (!this.hasDimmerBrightness) {
+              this.service.updateCharacteristic(this.platform.Characteristic.Brightness, this.hsv.v);
+            }
             this.updateColor();
+            break;
+          case `${this.context.topic}/state/brightness`:
+            this.brightness = parseInt(message.toString(), 10);
+            this.hasDimmerBrightness = true;
+            this.service.updateCharacteristic(this.platform.Characteristic.Brightness, this.brightness);
             break;
         }
       });
@@ -72,17 +81,26 @@ export class RGBLightAccesory {
   async handleOnSet(value: CharacteristicValue) {
     this.platform.MqttClient.client.publish(
       `${this.context.topic}/set/on`,
-      value.toString());
+      value.toString(),
+    );
   }
 
   async handleBrightnessGet(): Promise<CharacteristicValue> {
-    return this.hsv.v;
+    return this.hasDimmerBrightness ? this.brightness : this.hsv.v;
   }
 
   async handleBrightnessSet(value: CharacteristicValue) {
+    const target = value as number;
+    this.brightness = target;
+    this.hasDimmerBrightness = true;
+    this.platform.MqttClient.client.publish(
+      `${this.context.topic}/set/brightness`,
+      target.toString(),
+    );
     this.platform.MqttClient.client.publish(
       `${this.context.topic}/set/color_brightness`,
-      value.toString());
+      target.toString(),
+    );
   }
 
   async handleHueGet(): Promise<CharacteristicValue> {
@@ -94,7 +112,8 @@ export class RGBLightAccesory {
     this.rgb = HSVtoRGB(this.hsv.h, this.hsv.s, this.hsv.v);
     this.platform.MqttClient.client.publish(
       `${this.context.topic}/set/color`,
-      RGBToHex(this.rgb.r, this.rgb.g, this.rgb.b));
+      RGBToHex(this.rgb.r, this.rgb.g, this.rgb.b),
+    );
   }
 
   async handleSaturationGet(): Promise<CharacteristicValue> {
@@ -106,12 +125,15 @@ export class RGBLightAccesory {
     this.rgb = HSVtoRGB(this.hsv.h, this.hsv.s, this.hsv.v);
     this.platform.MqttClient.client.publish(
       `${this.context.topic}/set/color`,
-      RGBToHex(this.rgb.r, this.rgb.g, this.rgb.b));
+      RGBToHex(this.rgb.r, this.rgb.g, this.rgb.b),
+    );
   }
 
   private updateColor() {
     this.service.updateCharacteristic(this.platform.Characteristic.Hue, this.hsv.h);
     this.service.updateCharacteristic(this.platform.Characteristic.Saturation, this.hsv.s);
-    this.service.updateCharacteristic(this.platform.Characteristic.Brightness, this.hsv.v);
+    if (!this.hasDimmerBrightness) {
+      this.service.updateCharacteristic(this.platform.Characteristic.Brightness, this.hsv.v);
+    }
   }
 }
