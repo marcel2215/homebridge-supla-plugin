@@ -24,29 +24,27 @@ export class TemperatureAccessory {
     this.service.getCharacteristic(this.platform.Characteristic.CurrentTemperature)
       .onGet(this.handleTemperatureGet.bind(this));
 
-    setTimeout(() => {
-      this.platform.MqttClient.client.subscribe(`${this.context.topic}/state/temperature`);
-      this.platform.MqttClient.client.subscribe(`${this.context.topic}/state/connected`);
-      this.platform.MqttClient.client.on('message', (topic, message) => {
-        if (topic === `${this.context.topic}/state/temperature`) {
-          const value = parseFloat(message.toString());
-          if (!Number.isNaN(value)) {
-            this.temperature = this.clamp(value, -50, 100);
-            this.service.updateCharacteristic(
-              this.platform.Characteristic.CurrentTemperature,
-              this.temperature,
-            );
-          }
-        }
-        if (topic === `${this.context.topic}/state/connected`) {
-          this.connected = message.toString() === 'true';
+    this.platform.MqttClient.client.subscribe(`${this.context.topic}/state/temperature`);
+    this.platform.MqttClient.client.subscribe(`${this.context.topic}/state/connected`);
+    this.platform.MqttClient.client.on('message', (topic, message) => {
+      if (topic === `${this.context.topic}/state/temperature`) {
+        const value = parseFloat(message.toString());
+        if (!Number.isNaN(value)) {
+          this.temperature = this.clamp(value, -50, 100);
           this.service.updateCharacteristic(
-            this.platform.Characteristic.StatusFault,
-            this.connected ? 0 : 1,
+            this.platform.Characteristic.CurrentTemperature,
+            this.temperature,
           );
         }
-      });
-    }, 3000);
+      }
+      if (topic === `${this.context.topic}/state/connected`) {
+        this.connected = message.toString() === 'true';
+        this.service.updateCharacteristic(
+          this.platform.Characteristic.StatusFault,
+          this.connected ? 0 : 1,
+        );
+      }
+    });
   }
 
   async handleTemperatureGet(): Promise<CharacteristicValue> {

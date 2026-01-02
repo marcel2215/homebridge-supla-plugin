@@ -20,10 +20,15 @@ export class SuplaMqttClient {
     this.client.on('connect', () => {
       this.log.info('MQTT client connected');
     });
+    this.client.on('error', (error) => {
+      this.log.error(`MQTT client error: ${error.message}`);
+    });
   }
 
   public async discoverChannelsAsync() : Promise<Array<SuplaChannelContext>> {
     const subscriptionTopic = `supla/${this.context.username}/devices/+/channels/#`;
+    const includeHidden = this.resolveIncludeHidden();
+    const usernamePattern = this.escapeRegex(this.context.username);
     const channelMap = new Map<string, {
       deviceId: string;
       channelId: string;
@@ -42,7 +47,7 @@ export class SuplaMqttClient {
     const maxTimer = setTimeout(() => resolveDone?.(), maxWaitMs);
     const messageHandler = (topic: string, message: Buffer) => {
       const match = topic.match(
-        new RegExp(`^supla/${this.context.username}/devices/(\\d+)/channels/(\\d+)/(.*)$`),
+        new RegExp(`^supla/${usernamePattern}/devices/(\\d+)/channels/(\\d+)/(.*)$`),
       );
       if (!match) {
         return;
@@ -94,12 +99,14 @@ export class SuplaMqttClient {
     });
 
     const result : Array<SuplaChannelContext> = [];
+    let skippedHidden = 0;
     for (const entry of channelMap.values()) {
       const hiddenValue = entry.hidden ?? 'false';
       const hidden = typeof hiddenValue === 'string'
         ? hiddenValue.toLowerCase() === 'true'
         : Boolean(hiddenValue);
-      if (hidden) {
+      if (hidden && !includeHidden) {
+        skippedHidden += 1;
         continue;
       }
       const channelType = entry.channelType ?? 'UNKNOWN';
@@ -114,6 +121,9 @@ export class SuplaMqttClient {
         entry.deviceId,
         entry.channelId,
       ));
+    }
+    if (skippedHidden > 0 && !includeHidden) {
+      this.log.info(`Skipped ${skippedHidden} hidden channel(s). Set includeHidden=true to include them.`);
     }
     return result;
   }
@@ -134,5 +144,17 @@ export class SuplaMqttClient {
       return 'wss';
     }
     return rawProtocol;
+  }
+
+  private resolveIncludeHidden(): boolean {
+    const raw = this.context.includeHidden;
+    if (typeof raw === 'string') {
+      return ['1', 'true', 'on', 'yes'].includes(raw.toLowerCase());
+    }
+    return Boolean(raw);
+  }
+
+  private escapeRegex(value: string): string {
+    return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
   }
 }

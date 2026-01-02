@@ -30,38 +30,36 @@ export class ValveAccessory {
     this.service.getCharacteristic(this.platform.Characteristic.InUse)
       .onGet(this.handleInUseGet.bind(this));
 
-    setTimeout(() => {
-      this.platform.MqttClient.client.subscribe(`${this.context.topic}/state/closed`);
-      this.platform.MqttClient.client.subscribe(`${this.context.topic}/state/flooding`);
-      this.platform.MqttClient.client.subscribe(`${this.context.topic}/state/connected`);
-      this.platform.MqttClient.client.on('message', (topic, message) => {
-        if (topic === `${this.context.topic}/state/closed`) {
-          const closed = message.toString() === 'true';
-          this.active = closed
-            ? this.platform.Characteristic.Active.INACTIVE
-            : this.platform.Characteristic.Active.ACTIVE;
-          this.inUse = closed
-            ? this.platform.Characteristic.InUse.NOT_IN_USE
-            : this.platform.Characteristic.InUse.IN_USE;
-          this.service.updateCharacteristic(this.platform.Characteristic.Active, this.active);
-          this.service.updateCharacteristic(this.platform.Characteristic.InUse, this.inUse);
-        }
-        if (topic === `${this.context.topic}/state/flooding`) {
-          this.flooding = message.toString() === 'true';
-          this.service.updateCharacteristic(
-            this.platform.Characteristic.StatusFault,
-            this.flooding ? 1 : 0,
-          );
-        }
-        if (topic === `${this.context.topic}/state/connected`) {
-          this.connected = message.toString() === 'true';
-          this.service.updateCharacteristic(
-            this.platform.Characteristic.StatusFault,
-            this.connected && !this.flooding ? 0 : 1,
-          );
-        }
-      });
-    }, 3000);
+    this.platform.MqttClient.client.subscribe(`${this.context.topic}/state/closed`);
+    this.platform.MqttClient.client.subscribe(`${this.context.topic}/state/flooding`);
+    this.platform.MqttClient.client.subscribe(`${this.context.topic}/state/connected`);
+    this.platform.MqttClient.client.on('message', (topic, message) => {
+      if (topic === `${this.context.topic}/state/closed`) {
+        const closed = message.toString() === 'true';
+        this.active = closed
+          ? this.platform.Characteristic.Active.INACTIVE
+          : this.platform.Characteristic.Active.ACTIVE;
+        this.inUse = closed
+          ? this.platform.Characteristic.InUse.NOT_IN_USE
+          : this.platform.Characteristic.InUse.IN_USE;
+        this.service.updateCharacteristic(this.platform.Characteristic.Active, this.active);
+        this.service.updateCharacteristic(this.platform.Characteristic.InUse, this.inUse);
+      }
+      if (topic === `${this.context.topic}/state/flooding`) {
+        this.flooding = message.toString() === 'true';
+        this.service.updateCharacteristic(
+          this.platform.Characteristic.StatusFault,
+          this.flooding ? 1 : 0,
+        );
+      }
+      if (topic === `${this.context.topic}/state/connected`) {
+        this.connected = message.toString() === 'true';
+        this.service.updateCharacteristic(
+          this.platform.Characteristic.StatusFault,
+          this.connected && !this.flooding ? 0 : 1,
+        );
+      }
+    });
   }
 
   async handleActiveGet(): Promise<CharacteristicValue> {

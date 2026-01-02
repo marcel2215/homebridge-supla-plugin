@@ -36,39 +36,37 @@ export class ElectricityMeterAccessory {
     this.service.getCharacteristic(this.platform.Characteristic.CurrentAmbientLightLevel)
       .onGet(this.handleValueGet.bind(this));
 
-    setTimeout(() => {
-      this.platform.MqttClient.client.subscribe(`${this.context.topic}/state/#`);
-      this.platform.MqttClient.client.on('message', (topic, message) => {
-        if (topic === `${this.context.topic}/state/connected`) {
-          this.connected = message.toString() === 'true';
-          this.service.updateCharacteristic(
-            this.platform.Characteristic.StatusFault,
-            this.connected ? 0 : 1,
-          );
-          return;
-        }
-        if (!topic.startsWith(`${this.context.topic}/state/`)) {
-          return;
-        }
-        const key = topic.substring(`${this.context.topic}/state/`.length);
-        const metricIndex = this.metricPriority.indexOf(key);
-        if (metricIndex === -1) {
-          return;
-        }
-        const value = parseFloat(message.toString());
-        if (Number.isNaN(value)) {
-          return;
-        }
-        if (metricIndex <= this.selectedMetricIndex) {
-          this.selectedMetricIndex = metricIndex;
-          this.value = this.clamp(value, 0.0001, 100000);
-          this.service.updateCharacteristic(
-            this.platform.Characteristic.CurrentAmbientLightLevel,
-            this.value,
-          );
-        }
-      });
-    }, 3000);
+    this.platform.MqttClient.client.subscribe(`${this.context.topic}/state/#`);
+    this.platform.MqttClient.client.on('message', (topic, message) => {
+      if (topic === `${this.context.topic}/state/connected`) {
+        this.connected = message.toString() === 'true';
+        this.service.updateCharacteristic(
+          this.platform.Characteristic.StatusFault,
+          this.connected ? 0 : 1,
+        );
+        return;
+      }
+      if (!topic.startsWith(`${this.context.topic}/state/`)) {
+        return;
+      }
+      const key = topic.substring(`${this.context.topic}/state/`.length);
+      const metricIndex = this.metricPriority.indexOf(key);
+      if (metricIndex === -1) {
+        return;
+      }
+      const value = parseFloat(message.toString());
+      if (Number.isNaN(value)) {
+        return;
+      }
+      if (metricIndex <= this.selectedMetricIndex) {
+        this.selectedMetricIndex = metricIndex;
+        this.value = this.clamp(value, 0.0001, 100000);
+        this.service.updateCharacteristic(
+          this.platform.Characteristic.CurrentAmbientLightLevel,
+          this.value,
+        );
+      }
+    });
   }
 
   async handleValueGet(): Promise<CharacteristicValue> {

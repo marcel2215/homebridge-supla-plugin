@@ -8,6 +8,7 @@ export class RGBLightAccesory {
   private state = false;
   private hsv = {h: 0, s: 0, v: 0};
   private rgb = {r: 0, g: 0, b: 0};
+  private connected = true;
 
 
   constructor(
@@ -40,29 +41,35 @@ export class RGBLightAccesory {
       .onGet(this.handleSaturationGet.bind(this))
       .onSet(this.handleSaturationSet.bind(this));
 
-    setTimeout(() => {
-      this.platform.MqttClient.client.subscribe(`${this.context.topic}/state/on`);
-      this.platform.MqttClient.client.subscribe(`${this.context.topic}/state/color`);
-      this.platform.MqttClient.client.subscribe(`${this.context.topic}/state/color_brightness`);
+    this.platform.MqttClient.client.subscribe(`${this.context.topic}/state/on`);
+    this.platform.MqttClient.client.subscribe(`${this.context.topic}/state/color`);
+    this.platform.MqttClient.client.subscribe(`${this.context.topic}/state/color_brightness`);
+    this.platform.MqttClient.client.subscribe(`${this.context.topic}/state/connected`);
 
-      this.platform.MqttClient.client.on('message', (topic, message) => {
-        switch (topic) {
-          case `${this.context.topic}/state/on`:
-            this.state = message.toString() === 'true';
-            this.service.updateCharacteristic(this.platform.Characteristic.On, this.state);
-            break;
-          case `${this.context.topic}/state/color`:
-            this.rgb = HexToRGB(message.toString());
-            this.hsv = RGBtoHSV(this.rgb.r, this.rgb.g, this.rgb.b);
-            this.updateColor();
-            break;
-          case `${this.context.topic}/state/color_brightness`:
-            this.hsv.v = parseInt(message.toString());
-            this.updateColor();
-            break;
-        }
-      });
-    }, 3000);
+    this.platform.MqttClient.client.on('message', (topic, message) => {
+      switch (topic) {
+        case `${this.context.topic}/state/on`:
+          this.state = message.toString() === 'true';
+          this.service.updateCharacteristic(this.platform.Characteristic.On, this.state);
+          break;
+        case `${this.context.topic}/state/color`:
+          this.rgb = HexToRGB(message.toString());
+          this.hsv = RGBtoHSV(this.rgb.r, this.rgb.g, this.rgb.b);
+          this.updateColor();
+          break;
+        case `${this.context.topic}/state/color_brightness`:
+          this.hsv.v = parseInt(message.toString(), 10);
+          this.updateColor();
+          break;
+        case `${this.context.topic}/state/connected`:
+          this.connected = message.toString() === 'true';
+          this.service.updateCharacteristic(
+            this.platform.Characteristic.StatusFault,
+            this.connected ? 0 : 1,
+          );
+          break;
+      }
+    });
   }
 
   async handleOnGet(): Promise<CharacteristicValue> {

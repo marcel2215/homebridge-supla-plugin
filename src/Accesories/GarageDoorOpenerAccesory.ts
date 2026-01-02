@@ -6,6 +6,7 @@ import {SuplaChannelContext} from '../Heplers/SuplaChannelContext';
 export class GarageDoorOpenerAccesory {
   private service: Service;
   private state = this.platform.Characteristic.CurrentDoorState.CLOSED;
+  private connected = true;
 
   constructor(
         private readonly platform: SuplaPlatform,
@@ -31,17 +32,23 @@ export class GarageDoorOpenerAccesory {
         this.service.getCharacteristic(this.platform.Characteristic.ObstructionDetected)
           .onGet(this.handleObstructionDetectedGet.bind(this));
 
-        setTimeout(() => {
-          this.platform.MqttClient.client.subscribe(`${this.context.topic}/state/hi`);
-          this.platform.MqttClient.client.on('message', (topic, message) => {
-            if (topic === `${this.context.topic}/state/hi`) {
-              this.platform.log.info(`Door ${this.context.channelCaption} state changed to ${message.toString()}`);
-              this.state = message.toString() === 'true'
-                ? this.platform.Characteristic.CurrentDoorState.CLOSED : this.platform.Characteristic.CurrentDoorState.OPEN;
-              this.service.updateCharacteristic(this.platform.Characteristic.CurrentDoorState, this.state);
-            }
-          });
-        }, 3000);
+        this.platform.MqttClient.client.subscribe(`${this.context.topic}/state/hi`);
+        this.platform.MqttClient.client.subscribe(`${this.context.topic}/state/connected`);
+        this.platform.MqttClient.client.on('message', (topic, message) => {
+          if (topic === `${this.context.topic}/state/hi`) {
+            this.platform.log.info(`Door ${this.context.channelCaption} state changed to ${message.toString()}`);
+            this.state = message.toString() === 'true'
+              ? this.platform.Characteristic.CurrentDoorState.CLOSED : this.platform.Characteristic.CurrentDoorState.OPEN;
+            this.service.updateCharacteristic(this.platform.Characteristic.CurrentDoorState, this.state);
+          }
+          if (topic === `${this.context.topic}/state/connected`) {
+            this.connected = message.toString() === 'true';
+            this.service.updateCharacteristic(
+              this.platform.Characteristic.StatusFault,
+              this.connected ? 0 : 1,
+            );
+          }
+        });
   }
 
   async handleCurrentDoorStateGet(): Promise<CharacteristicValue> {

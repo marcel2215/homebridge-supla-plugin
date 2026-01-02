@@ -79,6 +79,7 @@ export class SuplaPlatform implements DynamicPlatformPlugin {
     const channels = rawChannels.map(channel => this.normalizeChannelContext(channel));
     this.log.info('Channels discovered:', channels.length);
     const channelUuids = new Set(channels.map(channel => this.getChannelUuid(channel)));
+    const shouldPrune = channelsOverride !== undefined && channels.length > 0;
 
     // loop over the discovered devices and register each one if it has not already been registered
     for (const channel of channels) {
@@ -102,13 +103,15 @@ export class SuplaPlatform implements DynamicPlatformPlugin {
       }
     }
 
-    const accessoriesToRemove = this.accessories.filter(accessory => !channelUuids.has(accessory.UUID));
-    for (const accessory of accessoriesToRemove) {
-      this.log.info('Removing existing accessory from cache:', accessory.displayName);
-      this.api.unregisterPlatformAccessories(PLUGIN_NAME, PLATFORM_NAME, [accessory]);
-      const index = this.accessories.indexOf(accessory);
-      if (index !== -1) {
-        this.accessories.splice(index, 1);
+    if (shouldPrune) {
+      const accessoriesToRemove = this.accessories.filter(accessory => !channelUuids.has(accessory.UUID));
+      for (const accessory of accessoriesToRemove) {
+        this.log.info('Removing existing accessory from cache:', accessory.displayName);
+        this.api.unregisterPlatformAccessories(PLUGIN_NAME, PLATFORM_NAME, [accessory]);
+        const index = this.accessories.indexOf(accessory);
+        if (index !== -1) {
+          this.accessories.splice(index, 1);
+        }
       }
     }
   }

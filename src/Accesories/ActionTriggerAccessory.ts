@@ -4,6 +4,7 @@ import { SuplaChannelContext } from '../Heplers/SuplaChannelContext';
 
 export class ActionTriggerAccessory {
   private service: Service;
+  private connected = true;
 
   constructor(
     private readonly platform: SuplaPlatform,
@@ -19,16 +20,22 @@ export class ActionTriggerAccessory {
 
     this.service.setCharacteristic(this.platform.Characteristic.Name, accessory.displayName);
 
-    setTimeout(() => {
-      this.platform.MqttClient.client.subscribe(`${this.context.topic}/state/action`);
-      this.platform.MqttClient.client.on('message', (topic, message) => {
-        if (topic !== `${this.context.topic}/state/action`) {
-          return;
+    this.platform.MqttClient.client.subscribe(`${this.context.topic}/state/action`);
+    this.platform.MqttClient.client.subscribe(`${this.context.topic}/state/connected`);
+    this.platform.MqttClient.client.on('message', (topic, message) => {
+      if (topic !== `${this.context.topic}/state/action`) {
+        if (topic === `${this.context.topic}/state/connected`) {
+          this.connected = message.toString() === 'true';
+          this.service.updateCharacteristic(
+            this.platform.Characteristic.StatusFault,
+            this.connected ? 0 : 1,
+          );
         }
-        const event = this.parseEvent(message.toString());
-        this.service.updateCharacteristic(this.platform.Characteristic.ProgrammableSwitchEvent, event);
-      });
-    }, 3000);
+        return;
+      }
+      const event = this.parseEvent(message.toString());
+      this.service.updateCharacteristic(this.platform.Characteristic.ProgrammableSwitchEvent, event);
+    });
   }
 
   private parseEvent(payload: string): number {

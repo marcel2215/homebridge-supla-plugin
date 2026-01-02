@@ -31,41 +31,39 @@ export class RollerShutterAccessory {
     this.service.getCharacteristic(this.platform.Characteristic.PositionState)
       .onGet(this.handlePositionStateGet.bind(this));
 
-    setTimeout(() => {
-      this.platform.MqttClient.client.subscribe(`${this.context.topic}/state/shut`);
-      this.platform.MqttClient.client.subscribe(`${this.context.topic}/state/connected`);
-      this.platform.MqttClient.client.on('message', (topic, message) => {
-        if (topic === `${this.context.topic}/state/shut`) {
-          const value = parseFloat(message.toString());
-          if (!Number.isNaN(value)) {
-            this.currentPosition = this.toPosition(value);
-            if (Math.abs(this.targetPosition - this.currentPosition) <= 1) {
-              this.targetPosition = this.currentPosition;
-            }
-            this.positionState = this.platform.Characteristic.PositionState.STOPPED;
-            this.service.updateCharacteristic(
-              this.platform.Characteristic.CurrentPosition,
-              this.currentPosition,
-            );
-            this.service.updateCharacteristic(
-              this.platform.Characteristic.TargetPosition,
-              this.targetPosition,
-            );
-            this.service.updateCharacteristic(
-              this.platform.Characteristic.PositionState,
-              this.positionState,
-            );
+    this.platform.MqttClient.client.subscribe(`${this.context.topic}/state/shut`);
+    this.platform.MqttClient.client.subscribe(`${this.context.topic}/state/connected`);
+    this.platform.MqttClient.client.on('message', (topic, message) => {
+      if (topic === `${this.context.topic}/state/shut`) {
+        const value = parseFloat(message.toString());
+        if (!Number.isNaN(value)) {
+          this.currentPosition = this.toPosition(value);
+          if (Math.abs(this.targetPosition - this.currentPosition) <= 1) {
+            this.targetPosition = this.currentPosition;
           }
-        }
-        if (topic === `${this.context.topic}/state/connected`) {
-          this.connected = message.toString() === 'true';
+          this.positionState = this.platform.Characteristic.PositionState.STOPPED;
           this.service.updateCharacteristic(
-            this.platform.Characteristic.StatusFault,
-            this.connected ? 0 : 1,
+            this.platform.Characteristic.CurrentPosition,
+            this.currentPosition,
+          );
+          this.service.updateCharacteristic(
+            this.platform.Characteristic.TargetPosition,
+            this.targetPosition,
+          );
+          this.service.updateCharacteristic(
+            this.platform.Characteristic.PositionState,
+            this.positionState,
           );
         }
-      });
-    }, 3000);
+      }
+      if (topic === `${this.context.topic}/state/connected`) {
+        this.connected = message.toString() === 'true';
+        this.service.updateCharacteristic(
+          this.platform.Characteristic.StatusFault,
+          this.connected ? 0 : 1,
+        );
+      }
+    });
   }
 
   async handleCurrentPositionGet(): Promise<CharacteristicValue> {

@@ -28,26 +28,24 @@ export class AirQualityAccessory {
     this.service.getCharacteristic(this.platform.Characteristic.AirQuality)
       .onGet(this.handleAirQualityGet.bind(this));
 
-    setTimeout(() => {
-      this.platform.MqttClient.client.subscribe(`${this.context.topic}/state/value`);
-      this.platform.MqttClient.client.subscribe(`${this.context.topic}/state/connected`);
-      this.platform.MqttClient.client.on('message', (topic, message) => {
-        if (topic === `${this.context.topic}/state/value`) {
-          const value = parseFloat(message.toString());
-          if (!Number.isNaN(value)) {
-            this.value = value;
-            this.updateMeasurements();
-          }
+    this.platform.MqttClient.client.subscribe(`${this.context.topic}/state/value`);
+    this.platform.MqttClient.client.subscribe(`${this.context.topic}/state/connected`);
+    this.platform.MqttClient.client.on('message', (topic, message) => {
+      if (topic === `${this.context.topic}/state/value`) {
+        const value = parseFloat(message.toString());
+        if (!Number.isNaN(value)) {
+          this.value = value;
+          this.updateMeasurements();
         }
-        if (topic === `${this.context.topic}/state/connected`) {
-          this.connected = message.toString() === 'true';
-          this.service.updateCharacteristic(
-            this.platform.Characteristic.StatusFault,
-            this.connected ? 0 : 1,
-          );
-        }
-      });
-    }, 3000);
+      }
+      if (topic === `${this.context.topic}/state/connected`) {
+        this.connected = message.toString() === 'true';
+        this.service.updateCharacteristic(
+          this.platform.Characteristic.StatusFault,
+          this.connected ? 0 : 1,
+        );
+      }
+    });
   }
 
   async handleAirQualityGet(): Promise<CharacteristicValue> {

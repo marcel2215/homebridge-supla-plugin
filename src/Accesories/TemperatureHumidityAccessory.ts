@@ -30,45 +30,43 @@ export class TemperatureHumidityAccessory {
     this.humidityService.getCharacteristic(this.platform.Characteristic.CurrentRelativeHumidity)
       .onGet(this.handleHumidityGet.bind(this));
 
-    setTimeout(() => {
-      this.platform.MqttClient.client.subscribe(`${this.context.topic}/state/temperature`);
-      this.platform.MqttClient.client.subscribe(`${this.context.topic}/state/humidity`);
-      this.platform.MqttClient.client.subscribe(`${this.context.topic}/state/connected`);
-      this.platform.MqttClient.client.on('message', (topic, message) => {
-        if (topic === `${this.context.topic}/state/temperature`) {
-          const value = parseFloat(message.toString());
-          if (!Number.isNaN(value)) {
-            this.temperature = this.clamp(value, -50, 100);
-            this.temperatureService.updateCharacteristic(
-              this.platform.Characteristic.CurrentTemperature,
-              this.temperature,
-            );
-          }
-        }
-        if (topic === `${this.context.topic}/state/humidity`) {
-          const value = parseFloat(message.toString());
-          if (!Number.isNaN(value)) {
-            this.humidity = this.clamp(value, 0, 100);
-            this.humidityService.updateCharacteristic(
-              this.platform.Characteristic.CurrentRelativeHumidity,
-              this.humidity,
-            );
-          }
-        }
-        if (topic === `${this.context.topic}/state/connected`) {
-          this.connected = message.toString() === 'true';
-          const faultValue = this.connected ? 0 : 1;
+    this.platform.MqttClient.client.subscribe(`${this.context.topic}/state/temperature`);
+    this.platform.MqttClient.client.subscribe(`${this.context.topic}/state/humidity`);
+    this.platform.MqttClient.client.subscribe(`${this.context.topic}/state/connected`);
+    this.platform.MqttClient.client.on('message', (topic, message) => {
+      if (topic === `${this.context.topic}/state/temperature`) {
+        const value = parseFloat(message.toString());
+        if (!Number.isNaN(value)) {
+          this.temperature = this.clamp(value, -50, 100);
           this.temperatureService.updateCharacteristic(
-            this.platform.Characteristic.StatusFault,
-            faultValue,
-          );
-          this.humidityService.updateCharacteristic(
-            this.platform.Characteristic.StatusFault,
-            faultValue,
+            this.platform.Characteristic.CurrentTemperature,
+            this.temperature,
           );
         }
-      });
-    }, 3000);
+      }
+      if (topic === `${this.context.topic}/state/humidity`) {
+        const value = parseFloat(message.toString());
+        if (!Number.isNaN(value)) {
+          this.humidity = this.clamp(value, 0, 100);
+          this.humidityService.updateCharacteristic(
+            this.platform.Characteristic.CurrentRelativeHumidity,
+            this.humidity,
+          );
+        }
+      }
+      if (topic === `${this.context.topic}/state/connected`) {
+        this.connected = message.toString() === 'true';
+        const faultValue = this.connected ? 0 : 1;
+        this.temperatureService.updateCharacteristic(
+          this.platform.Characteristic.StatusFault,
+          faultValue,
+        );
+        this.humidityService.updateCharacteristic(
+          this.platform.Characteristic.StatusFault,
+          faultValue,
+        );
+      }
+    });
   }
 
   async handleTemperatureGet(): Promise<CharacteristicValue> {

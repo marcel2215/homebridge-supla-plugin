@@ -10,6 +10,8 @@ export class DimmerRgbLightAccessory {
   private rgb = {r: 0, g: 0, b: 0};
   private brightness = 0;
   private hasDimmerBrightness = false;
+  private connected = true;
+  private overcurrent = false;
 
   constructor(
     private readonly platform: SuplaPlatform,
@@ -41,37 +43,45 @@ export class DimmerRgbLightAccessory {
       .onGet(this.handleSaturationGet.bind(this))
       .onSet(this.handleSaturationSet.bind(this));
 
-    setTimeout(() => {
-      this.platform.MqttClient.client.subscribe(`${this.context.topic}/state/on`);
-      this.platform.MqttClient.client.subscribe(`${this.context.topic}/state/color`);
-      this.platform.MqttClient.client.subscribe(`${this.context.topic}/state/color_brightness`);
-      this.platform.MqttClient.client.subscribe(`${this.context.topic}/state/brightness`);
-      this.platform.MqttClient.client.on('message', (topic, message) => {
-        switch (topic) {
-          case `${this.context.topic}/state/on`:
-            this.state = message.toString() === 'true';
-            this.service.updateCharacteristic(this.platform.Characteristic.On, this.state);
-            break;
-          case `${this.context.topic}/state/color`:
-            this.rgb = HexToRGB(message.toString());
-            this.hsv = RGBtoHSV(this.rgb.r, this.rgb.g, this.rgb.b);
-            this.updateColor();
-            break;
-          case `${this.context.topic}/state/color_brightness`:
-            this.hsv.v = parseInt(message.toString(), 10);
-            if (!this.hasDimmerBrightness) {
-              this.service.updateCharacteristic(this.platform.Characteristic.Brightness, this.hsv.v);
-            }
-            this.updateColor();
-            break;
-          case `${this.context.topic}/state/brightness`:
-            this.brightness = parseInt(message.toString(), 10);
-            this.hasDimmerBrightness = true;
-            this.service.updateCharacteristic(this.platform.Characteristic.Brightness, this.brightness);
-            break;
-        }
-      });
-    }, 3000);
+    this.platform.MqttClient.client.subscribe(`${this.context.topic}/state/on`);
+    this.platform.MqttClient.client.subscribe(`${this.context.topic}/state/color`);
+    this.platform.MqttClient.client.subscribe(`${this.context.topic}/state/color_brightness`);
+    this.platform.MqttClient.client.subscribe(`${this.context.topic}/state/brightness`);
+    this.platform.MqttClient.client.subscribe(`${this.context.topic}/state/connected`);
+    this.platform.MqttClient.client.subscribe(`${this.context.topic}/state/overcurrent_relay_off`);
+    this.platform.MqttClient.client.on('message', (topic, message) => {
+      switch (topic) {
+        case `${this.context.topic}/state/on`:
+          this.state = message.toString() === 'true';
+          this.service.updateCharacteristic(this.platform.Characteristic.On, this.state);
+          break;
+        case `${this.context.topic}/state/color`:
+          this.rgb = HexToRGB(message.toString());
+          this.hsv = RGBtoHSV(this.rgb.r, this.rgb.g, this.rgb.b);
+          this.updateColor();
+          break;
+        case `${this.context.topic}/state/color_brightness`:
+          this.hsv.v = parseInt(message.toString(), 10);
+          if (!this.hasDimmerBrightness) {
+            this.service.updateCharacteristic(this.platform.Characteristic.Brightness, this.hsv.v);
+          }
+          this.updateColor();
+          break;
+        case `${this.context.topic}/state/brightness`:
+          this.brightness = parseInt(message.toString(), 10);
+          this.hasDimmerBrightness = true;
+          this.service.updateCharacteristic(this.platform.Characteristic.Brightness, this.brightness);
+          break;
+        case `${this.context.topic}/state/connected`:
+          this.connected = message.toString() === 'true';
+          this.updateFault();
+          break;
+        case `${this.context.topic}/state/overcurrent_relay_off`:
+          this.overcurrent = message.toString() === 'true';
+          this.updateFault();
+          break;
+      }
+    });
   }
 
   async handleOnGet(): Promise<CharacteristicValue> {
@@ -135,5 +145,10 @@ export class DimmerRgbLightAccessory {
     if (!this.hasDimmerBrightness) {
       this.service.updateCharacteristic(this.platform.Characteristic.Brightness, this.hsv.v);
     }
+  }
+
+  private updateFault() {
+    const fault = this.connected && !this.overcurrent ? 0 : 1;
+    this.service.updateCharacteristic(this.platform.Characteristic.StatusFault, fault);
   }
 }

@@ -5,6 +5,8 @@ import { SuplaChannelContext } from '../Heplers/SuplaChannelContext';
 export class SwitchAccessory {
   private service: Service;
   private state = false;
+  private connected = true;
+  private overcurrent = false;
 
   constructor(
     private readonly platform: SuplaPlatform,
@@ -24,15 +26,23 @@ export class SwitchAccessory {
       .onGet(this.handleOnGet.bind(this))
       .onSet(this.handleOnSet.bind(this));
 
-    setTimeout(() => {
-      this.platform.MqttClient.client.subscribe(`${this.context.topic}/state/on`);
-      this.platform.MqttClient.client.on('message', (topic, message) => {
-        if (topic === `${this.context.topic}/state/on`) {
-          this.state = message.toString() === 'true';
-          this.service.updateCharacteristic(this.platform.Characteristic.On, this.state);
-        }
-      });
-    }, 3000);
+    this.platform.MqttClient.client.subscribe(`${this.context.topic}/state/on`);
+    this.platform.MqttClient.client.subscribe(`${this.context.topic}/state/connected`);
+    this.platform.MqttClient.client.subscribe(`${this.context.topic}/state/overcurrent_relay_off`);
+    this.platform.MqttClient.client.on('message', (topic, message) => {
+      if (topic === `${this.context.topic}/state/on`) {
+        this.state = message.toString() === 'true';
+        this.service.updateCharacteristic(this.platform.Characteristic.On, this.state);
+      }
+      if (topic === `${this.context.topic}/state/connected`) {
+        this.connected = message.toString() === 'true';
+        this.updateFault();
+      }
+      if (topic === `${this.context.topic}/state/overcurrent_relay_off`) {
+        this.overcurrent = message.toString() === 'true';
+        this.updateFault();
+      }
+    });
   }
 
   async handleOnGet(): Promise<CharacteristicValue> {
@@ -47,5 +57,10 @@ export class SwitchAccessory {
     setTimeout(() => {
       this.service.updateCharacteristic(this.platform.Characteristic.On, this.state);
     }, 300);
+  }
+
+  private updateFault() {
+    const fault = this.connected && !this.overcurrent ? 0 : 1;
+    this.service.updateCharacteristic(this.platform.Characteristic.StatusFault, fault);
   }
 }

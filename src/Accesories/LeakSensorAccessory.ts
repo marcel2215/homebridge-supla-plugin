@@ -24,26 +24,24 @@ export class LeakSensorAccessory {
     this.service.getCharacteristic(this.platform.Characteristic.LeakDetected)
       .onGet(this.handleStateGet.bind(this));
 
-    setTimeout(() => {
-      this.platform.MqttClient.client.subscribe(`${this.context.topic}/state/hi`);
-      this.platform.MqttClient.client.subscribe(`${this.context.topic}/state/connected`);
-      this.platform.MqttClient.client.on('message', (topic, message) => {
-        if (topic === `${this.context.topic}/state/hi`) {
-          const leak = message.toString() === 'true';
-          this.state = leak
-            ? this.platform.Characteristic.LeakDetected.LEAK_DETECTED
-            : this.platform.Characteristic.LeakDetected.LEAK_NOT_DETECTED;
-          this.service.updateCharacteristic(this.platform.Characteristic.LeakDetected, this.state);
-        }
-        if (topic === `${this.context.topic}/state/connected`) {
-          this.connected = message.toString() === 'true';
-          this.service.updateCharacteristic(
-            this.platform.Characteristic.StatusFault,
-            this.connected ? 0 : 1,
-          );
-        }
-      });
-    }, 3000);
+    this.platform.MqttClient.client.subscribe(`${this.context.topic}/state/hi`);
+    this.platform.MqttClient.client.subscribe(`${this.context.topic}/state/connected`);
+    this.platform.MqttClient.client.on('message', (topic, message) => {
+      if (topic === `${this.context.topic}/state/hi`) {
+        const leak = message.toString() === 'true';
+        this.state = leak
+          ? this.platform.Characteristic.LeakDetected.LEAK_DETECTED
+          : this.platform.Characteristic.LeakDetected.LEAK_NOT_DETECTED;
+        this.service.updateCharacteristic(this.platform.Characteristic.LeakDetected, this.state);
+      }
+      if (topic === `${this.context.topic}/state/connected`) {
+        this.connected = message.toString() === 'true';
+        this.service.updateCharacteristic(
+          this.platform.Characteristic.StatusFault,
+          this.connected ? 0 : 1,
+        );
+      }
+    });
   }
 
   async handleStateGet(): Promise<CharacteristicValue> {

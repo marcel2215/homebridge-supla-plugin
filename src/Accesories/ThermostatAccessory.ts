@@ -37,80 +37,78 @@ export class ThermostatAccessory {
       .onGet(this.handleTargetStateGet.bind(this))
       .onSet(this.handleTargetStateSet.bind(this));
 
-    setTimeout(() => {
-      this.platform.MqttClient.client.subscribe(`${this.context.topic}/state/temperature_setpoint`);
-      this.platform.MqttClient.client.subscribe(`${this.context.topic}/state/mode`);
-      this.platform.MqttClient.client.subscribe(`${this.context.topic}/state/action`);
-      this.platform.MqttClient.client.subscribe(`${this.context.topic}/state/is_on`);
-      this.platform.MqttClient.client.subscribe(`${this.context.topic}/state/temperature`);
-      this.platform.MqttClient.client.subscribe(`${this.context.topic}/state/connected`);
-      this.platform.MqttClient.client.on('message', (topic, message) => {
-        if (topic === `${this.context.topic}/state/temperature_setpoint`) {
-          const value = parseFloat(message.toString());
-          if (!Number.isNaN(value)) {
-            this.targetTemperature = this.clamp(value, 5, 35);
-            this.service.updateCharacteristic(
-              this.platform.Characteristic.TargetTemperature,
-              this.targetTemperature,
-            );
-            if (!this.hasCurrentTemperature) {
-              this.currentTemperature = this.targetTemperature;
-              this.service.updateCharacteristic(
-                this.platform.Characteristic.CurrentTemperature,
-                this.currentTemperature,
-              );
-            }
-          }
-        }
-        if (topic === `${this.context.topic}/state/temperature`) {
-          const value = parseFloat(message.toString());
-          if (!Number.isNaN(value)) {
-            this.currentTemperature = this.clamp(value, -50, 100);
-            this.hasCurrentTemperature = true;
+    this.platform.MqttClient.client.subscribe(`${this.context.topic}/state/temperature_setpoint`);
+    this.platform.MqttClient.client.subscribe(`${this.context.topic}/state/mode`);
+    this.platform.MqttClient.client.subscribe(`${this.context.topic}/state/action`);
+    this.platform.MqttClient.client.subscribe(`${this.context.topic}/state/is_on`);
+    this.platform.MqttClient.client.subscribe(`${this.context.topic}/state/temperature`);
+    this.platform.MqttClient.client.subscribe(`${this.context.topic}/state/connected`);
+    this.platform.MqttClient.client.on('message', (topic, message) => {
+      if (topic === `${this.context.topic}/state/temperature_setpoint`) {
+        const value = parseFloat(message.toString());
+        if (!Number.isNaN(value)) {
+          this.targetTemperature = this.clamp(value, 5, 35);
+          this.service.updateCharacteristic(
+            this.platform.Characteristic.TargetTemperature,
+            this.targetTemperature,
+          );
+          if (!this.hasCurrentTemperature) {
+            this.currentTemperature = this.targetTemperature;
             this.service.updateCharacteristic(
               this.platform.Characteristic.CurrentTemperature,
               this.currentTemperature,
             );
           }
         }
-        if (topic === `${this.context.topic}/state/mode`) {
-          const mode = message.toString();
-          this.targetState = this.toTargetState(mode, this.isOn);
+      }
+      if (topic === `${this.context.topic}/state/temperature`) {
+        const value = parseFloat(message.toString());
+        if (!Number.isNaN(value)) {
+          this.currentTemperature = this.clamp(value, -50, 100);
+          this.hasCurrentTemperature = true;
           this.service.updateCharacteristic(
-            this.platform.Characteristic.TargetHeatingCoolingState,
-            this.targetState,
+            this.platform.Characteristic.CurrentTemperature,
+            this.currentTemperature,
           );
         }
-        if (topic === `${this.context.topic}/state/action`) {
-          const action = message.toString();
-          this.currentState = this.toCurrentState(action, this.isOn);
-          this.service.updateCharacteristic(
-            this.platform.Characteristic.CurrentHeatingCoolingState,
-            this.currentState,
-          );
-        }
-        if (topic === `${this.context.topic}/state/is_on`) {
-          this.isOn = message.toString() === 'true';
-          this.targetState = this.toTargetState(undefined, this.isOn, this.targetState);
-          this.currentState = this.toCurrentState(undefined, this.isOn, this.currentState);
-          this.service.updateCharacteristic(
-            this.platform.Characteristic.TargetHeatingCoolingState,
-            this.targetState,
-          );
-          this.service.updateCharacteristic(
-            this.platform.Characteristic.CurrentHeatingCoolingState,
-            this.currentState,
-          );
-        }
-        if (topic === `${this.context.topic}/state/connected`) {
-          this.connected = message.toString() === 'true';
-          this.service.updateCharacteristic(
-            this.platform.Characteristic.StatusFault,
-            this.connected ? 0 : 1,
-          );
-        }
-      });
-    }, 3000);
+      }
+      if (topic === `${this.context.topic}/state/mode`) {
+        const mode = message.toString();
+        this.targetState = this.toTargetState(mode, this.isOn);
+        this.service.updateCharacteristic(
+          this.platform.Characteristic.TargetHeatingCoolingState,
+          this.targetState,
+        );
+      }
+      if (topic === `${this.context.topic}/state/action`) {
+        const action = message.toString();
+        this.currentState = this.toCurrentState(action, this.isOn);
+        this.service.updateCharacteristic(
+          this.platform.Characteristic.CurrentHeatingCoolingState,
+          this.currentState,
+        );
+      }
+      if (topic === `${this.context.topic}/state/is_on`) {
+        this.isOn = message.toString() === 'true';
+        this.targetState = this.toTargetState(undefined, this.isOn, this.targetState);
+        this.currentState = this.toCurrentState(undefined, this.isOn, this.currentState);
+        this.service.updateCharacteristic(
+          this.platform.Characteristic.TargetHeatingCoolingState,
+          this.targetState,
+        );
+        this.service.updateCharacteristic(
+          this.platform.Characteristic.CurrentHeatingCoolingState,
+          this.currentState,
+        );
+      }
+      if (topic === `${this.context.topic}/state/connected`) {
+        this.connected = message.toString() === 'true';
+        this.service.updateCharacteristic(
+          this.platform.Characteristic.StatusFault,
+          this.connected ? 0 : 1,
+        );
+      }
+    });
   }
 
   async handleCurrentTemperatureGet(): Promise<CharacteristicValue> {
