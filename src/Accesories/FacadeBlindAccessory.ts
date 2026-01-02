@@ -111,13 +111,33 @@ export class FacadeBlindAccessory {
     }
     this.service.updateCharacteristic(this.platform.Characteristic.TargetPosition, this.targetPosition);
     this.service.updateCharacteristic(this.platform.Characteristic.PositionState, this.positionState);
-    this.platform.log.debug(
-      `Publishing ${this.context.topic}/set/shut = ${this.toShut(this.targetPosition).toString()}`,
-    );
-    this.platform.MqttClient.client.publish(
-      `${this.context.topic}/set/shut`,
-      this.toShut(this.targetPosition).toString(),
-    );
+    const controlMode = this.platform.getCoveringControlMode();
+    const shutValue = this.toShut(this.targetPosition).toString();
+    if (controlMode === 'set' || controlMode === 'hybrid') {
+      const topic = `${this.context.topic}/${this.platform.getCoveringSetTopicSuffix()}`;
+      this.platform.log.debug(`Publishing ${topic} = ${shutValue}`);
+      this.platform.MqttClient.client.publish(topic, shutValue, (error) => {
+        if (error) {
+          this.platform.log.error(`Publish failed for ${topic}: ${error.message}`);
+        }
+      });
+    }
+    if (controlMode === 'execute_action' || controlMode === 'hybrid') {
+      if (this.targetPosition === 0 || this.targetPosition === 100) {
+        const action = this.targetPosition === 0 ? 'close' : 'open';
+        const actionTopic = `${this.context.topic}/execute_action`;
+        this.platform.log.debug(`Publishing ${actionTopic} = ${action}`);
+        this.platform.MqttClient.client.publish(actionTopic, action, (error) => {
+          if (error) {
+            this.platform.log.error(`Publish failed for ${actionTopic}: ${error.message}`);
+          }
+        });
+      } else if (controlMode === 'execute_action') {
+        this.platform.log.warn(
+          `Covering control mode execute_action does not support partial positions (${this.targetPosition}).`,
+        );
+      }
+    }
   }
 
   async handlePositionStateGet(): Promise<CharacteristicValue> {
@@ -139,13 +159,14 @@ export class FacadeBlindAccessory {
       this.platform.Characteristic.TargetHorizontalTiltAngle,
       this.targetTiltAngle,
     );
-    this.platform.log.debug(
-      `Publishing ${this.context.topic}/set/tilt = ${this.toTiltValue(this.targetTiltAngle).toString()}`,
-    );
-    this.platform.MqttClient.client.publish(
-      `${this.context.topic}/set/tilt`,
-      this.toTiltValue(this.targetTiltAngle).toString(),
-    );
+    const tiltValue = this.toTiltValue(this.targetTiltAngle).toString();
+    const tiltTopic = `${this.context.topic}/${this.platform.getCoveringTiltTopicSuffix()}`;
+    this.platform.log.debug(`Publishing ${tiltTopic} = ${tiltValue}`);
+    this.platform.MqttClient.client.publish(tiltTopic, tiltValue, (error) => {
+      if (error) {
+        this.platform.log.error(`Publish failed for ${tiltTopic}: ${error.message}`);
+      }
+    });
   }
 
   private toPosition(shutValue: number): number {

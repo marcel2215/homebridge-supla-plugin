@@ -6,7 +6,7 @@ import { LightAccesory } from './Accesories/LightBulbAccesory';
 import * as fs from 'fs';
 import {SuplaMqttClient} from './Heplers/SuplaMqttClient';
 import {RGBLightAccesory} from './Accesories/RGBLightBulbAccesory';
-import {WicketAccesory} from './Accesories/WicketAccesory';
+import {DoorAccessory} from './Accesories/DoorAccessory';
 import {SuplaMqttClientContext} from './Heplers/SuplaMqttClientContext';
 import {SuplaChannelContext} from './Heplers/SuplaChannelContext';
 import {DimmerAccessory} from './Accesories/DimmerAccessory';
@@ -37,6 +37,9 @@ export class SuplaPlatform implements DynamicPlatformPlugin {
   public MqttClient!: SuplaMqttClient;
 
   public readonly accessories: PlatformAccessory[] = [];
+  private readonly coveringControlMode: 'set' | 'execute_action' | 'hybrid';
+  private readonly coveringSetTopicSuffix: string;
+  private readonly coveringTiltTopicSuffix: string;
 
   constructor(
     public readonly log: Logger,
@@ -44,6 +47,14 @@ export class SuplaPlatform implements DynamicPlatformPlugin {
     public readonly api: API,
   ) {
     this.log.debug('Finished initializing platform:', this.config.name);
+    const configView = this.config as unknown as {
+      coveringControlMode?: string;
+      coveringSetTopicSuffix?: string;
+      coveringTiltTopicSuffix?: string;
+    };
+    this.coveringControlMode = this.normalizeCoveringControlMode(configView.coveringControlMode);
+    this.coveringSetTopicSuffix = this.normalizeTopicSuffix(configView.coveringSetTopicSuffix || 'set/shut');
+    this.coveringTiltTopicSuffix = this.normalizeTopicSuffix(configView.coveringTiltTopicSuffix || 'set/tilt');
 
     this.api.on('didFinishLaunching', () => {
       log.debug('Executed didFinishLaunching callback');
@@ -216,17 +227,17 @@ export class SuplaPlatform implements DynamicPlatformPlugin {
     );
     switch (channel.channelFunction) {
       case 'CONTROLLINGTHEGARAGEDOOR':
-      case 'CONTROLLINGTHEGATE':
         new GarageDoorOpenerAccesory(this, accessory, channel);
+        return true;
+      case 'CONTROLLINGTHEGATE':
+      case 'CONTROLLINGTHEGATEWAYLOCK':
+        new DoorAccessory(this, accessory, channel);
         return true;
       case 'LIGHTSWITCH':
         new LightAccesory(this, accessory, channel);
         return true;
       case 'POWERSWITCH':
         new SwitchAccessory(this, accessory, channel);
-        return true;
-      case 'CONTROLLINGTHEGATEWAYLOCK':
-        new WicketAccesory(this, accessory, channel);
         return true;
       case 'RGBLIGHTING':
         new RGBLightAccesory(this, accessory, channel);
@@ -325,5 +336,32 @@ export class SuplaPlatform implements DynamicPlatformPlugin {
   private isLeakSensorChannel(channel: SuplaChannelContext): boolean {
     const caption = (channel.channelCaption ?? '').toLowerCase();
     return ['leak', 'flood', 'water', 'zalania'].some(term => caption.includes(term));
+  }
+
+  public getCoveringControlMode(): 'set' | 'execute_action' | 'hybrid' {
+    return this.coveringControlMode;
+  }
+
+  public getCoveringSetTopicSuffix(): string {
+    return this.coveringSetTopicSuffix;
+  }
+
+  public getCoveringTiltTopicSuffix(): string {
+    return this.coveringTiltTopicSuffix;
+  }
+
+  private normalizeCoveringControlMode(value?: string): 'set' | 'execute_action' | 'hybrid' {
+    const normalized = (value ?? 'set').toString().toLowerCase();
+    if (normalized === 'execute_action') {
+      return 'execute_action';
+    }
+    if (normalized === 'hybrid') {
+      return 'hybrid';
+    }
+    return 'set';
+  }
+
+  private normalizeTopicSuffix(value: string): string {
+    return value.toString().replace(/^\/+/, '');
   }
 }

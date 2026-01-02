@@ -33,6 +33,26 @@
       "type": "boolean",
       "default": false
     },
+    "coveringControlMode": {
+      "title": "Covering Control Mode",
+      "type": "string",
+      "default": "set",
+      "enum": [
+        "set",
+        "execute_action",
+        "hybrid"
+      ]
+    },
+    "coveringSetTopicSuffix": {
+      "title": "Covering Set Topic Suffix",
+      "type": "string",
+      "default": "set/shut"
+    },
+    "coveringTiltTopicSuffix": {
+      "title": "Covering Tilt Topic Suffix",
+      "type": "string",
+      "default": "set/tilt"
+    },
     "username": {
       "title": "Username",
       "type": "string",
