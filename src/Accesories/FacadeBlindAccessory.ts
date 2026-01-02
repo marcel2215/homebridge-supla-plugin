@@ -111,6 +111,9 @@ export class FacadeBlindAccessory {
     }
     this.service.updateCharacteristic(this.platform.Characteristic.TargetPosition, this.targetPosition);
     this.service.updateCharacteristic(this.platform.Characteristic.PositionState, this.positionState);
+    this.platform.log.debug(
+      `Publishing ${this.context.topic}/set/shut = ${this.toShut(this.targetPosition).toString()}`,
+    );
     this.platform.MqttClient.client.publish(
       `${this.context.topic}/set/shut`,
       this.toShut(this.targetPosition).toString(),
@@ -135,6 +138,9 @@ export class FacadeBlindAccessory {
     this.service.updateCharacteristic(
       this.platform.Characteristic.TargetHorizontalTiltAngle,
       this.targetTiltAngle,
+    );
+    this.platform.log.debug(
+      `Publishing ${this.context.topic}/set/tilt = ${this.toTiltValue(this.targetTiltAngle).toString()}`,
     );
     this.platform.MqttClient.client.publish(
       `${this.context.topic}/set/tilt`,

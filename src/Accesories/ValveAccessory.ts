@@ -68,6 +68,9 @@ export class ValveAccessory {
 
   async handleActiveSet(value: CharacteristicValue) {
     const active = value === this.platform.Characteristic.Active.ACTIVE;
+    this.platform.log.debug(
+      `Publishing ${this.context.topic}/set/closed = ${(!active).toString()}`,
+    );
     this.platform.MqttClient.client.publish(
       `${this.context.topic}/set/closed`,
       (!active).toString(),

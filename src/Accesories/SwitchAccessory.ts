@@ -50,6 +50,9 @@ export class SwitchAccessory {
   }
 
   async handleOnSet(value: CharacteristicValue) {
+    this.platform.log.debug(
+      `Publishing ${this.context.topic}/set/on = ${value.toString()}`,
+    );
     this.platform.MqttClient.client.publish(
       `${this.context.topic}/set/on`,
       value.toString(),

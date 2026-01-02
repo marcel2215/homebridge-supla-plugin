@@ -13,12 +13,30 @@ export class SuplaMqttClient {
       password: context.password,
     };
     const protocol = this.resolveProtocol();
+    this.log.info(
+      `MQTT connecting to ${protocol}://${context.host}:${context.port} as ${context.username}`,
+    );
+    if (!context.username || !context.host || !context.port) {
+      this.log.warn('MQTT config looks incomplete; check host/port/username.');
+    }
     this.client = mqtt.connect(`${protocol}://${context.host}:${context.port}`, options);
 
     this.client.setMaxListeners(0);
 
     this.client.on('connect', () => {
       this.log.info('MQTT client connected');
+    });
+    this.client.on('reconnect', () => {
+      this.log.warn('MQTT client reconnecting');
+    });
+    this.client.on('close', () => {
+      this.log.warn('MQTT client closed');
+    });
+    this.client.on('offline', () => {
+      this.log.warn('MQTT client offline');
+    });
+    this.client.on('end', () => {
+      this.log.warn('MQTT client disconnected');
     });
     this.client.on('error', (error) => {
       this.log.error(`MQTT client error: ${error.message}`);
@@ -29,6 +47,10 @@ export class SuplaMqttClient {
     const subscriptionTopic = `supla/${this.context.username}/devices/+/channels/#`;
     const includeHidden = this.resolveIncludeHidden();
     const usernamePattern = this.escapeRegex(this.context.username);
+    this.log.info('Discovering channels via MQTT');
+    this.log.debug(
+      `Discovery subscribe topic: ${subscriptionTopic} includeHidden=${includeHidden}`,
+    );
     const channelMap = new Map<string, {
       deviceId: string;
       channelId: string;
@@ -81,7 +103,7 @@ export class SuplaMqttClient {
 
     this.client.subscribe(subscriptionTopic, (err) => {
       if (err) {
-        this.log.error(err.message);
+        this.log.error(`MQTT subscribe failed for ${subscriptionTopic}: ${err.message}`);
         resolveDone?.();
       }
     });
@@ -94,7 +116,7 @@ export class SuplaMqttClient {
     this.client.removeListener('message', messageHandler);
     this.client.unsubscribe(subscriptionTopic, (err) => {
       if (err) {
-        this.log.error(err.message);
+        this.log.error(`MQTT unsubscribe failed for ${subscriptionTopic}: ${err.message}`);
       }
     });
 
@@ -113,6 +135,14 @@ export class SuplaMqttClient {
       const channelFunction = entry.channelFunction ?? 'UNKNOWN';
       const caption = entry.channelCaption ?? `Device ${entry.deviceId} Channel ${entry.channelId}`;
       const topic = `supla/${this.context.username}/devices/${entry.deviceId}/channels/${entry.channelId}`;
+      if (channelFunction === 'UNKNOWN' || channelType === 'UNKNOWN') {
+        this.log.warn(
+          `Channel ${entry.deviceId}/${entry.channelId} missing metadata (function=${channelFunction}, type=${channelType})`,
+        );
+      }
+      this.log.debug(
+        `Discovered channel ${caption} (${entry.deviceId}/${entry.channelId}) function=${channelFunction} type=${channelType}`,
+      );
       result.push(new SuplaChannelContext(
         topic,
         channelType,
@@ -122,9 +152,15 @@ export class SuplaMqttClient {
         entry.channelId,
       ));
     }
+    if (channelMap.size === 0) {
+      this.log.warn(
+        `No channels discovered within ${maxWaitMs}ms. Check MQTT ACLs, username, or retained topics.`,
+      );
+    }
     if (skippedHidden > 0 && !includeHidden) {
       this.log.info(`Skipped ${skippedHidden} hidden channel(s). Set includeHidden=true to include them.`);
     }
+    this.log.info(`MQTT discovery complete. Channels discovered: ${result.length}`);
     return result;
   }
 

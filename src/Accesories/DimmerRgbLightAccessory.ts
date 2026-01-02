@@ -89,6 +89,9 @@ export class DimmerRgbLightAccessory {
   }
 
   async handleOnSet(value: CharacteristicValue) {
+    this.platform.log.debug(
+      `Publishing ${this.context.topic}/set/on = ${value.toString()}`,
+    );
     this.platform.MqttClient.client.publish(
       `${this.context.topic}/set/on`,
       value.toString(),
@@ -103,9 +106,15 @@ export class DimmerRgbLightAccessory {
     const target = value as number;
     this.brightness = target;
     this.hasDimmerBrightness = true;
+    this.platform.log.debug(
+      `Publishing ${this.context.topic}/set/brightness = ${target.toString()}`,
+    );
     this.platform.MqttClient.client.publish(
       `${this.context.topic}/set/brightness`,
       target.toString(),
+    );
+    this.platform.log.debug(
+      `Publishing ${this.context.topic}/set/color_brightness = ${target.toString()}`,
     );
     this.platform.MqttClient.client.publish(
       `${this.context.topic}/set/color_brightness`,
@@ -120,6 +129,9 @@ export class DimmerRgbLightAccessory {
   async handleHueSet(value: CharacteristicValue) {
     this.hsv.h = value as number;
     this.rgb = HSVtoRGB(this.hsv.h, this.hsv.s, this.hsv.v);
+    this.platform.log.debug(
+      `Publishing ${this.context.topic}/set/color = ${RGBToHex(this.rgb.r, this.rgb.g, this.rgb.b)}`,
+    );
     this.platform.MqttClient.client.publish(
       `${this.context.topic}/set/color`,
       RGBToHex(this.rgb.r, this.rgb.g, this.rgb.b),
@@ -133,6 +145,9 @@ export class DimmerRgbLightAccessory {
   async handleSaturationSet(value: CharacteristicValue) {
     this.hsv.s = value as number;
     this.rgb = HSVtoRGB(this.hsv.h, this.hsv.s, this.hsv.v);
+    this.platform.log.debug(
+      `Publishing ${this.context.topic}/set/color = ${RGBToHex(this.rgb.r, this.rgb.g, this.rgb.b)}`,
+    );
     this.platform.MqttClient.client.publish(
       `${this.context.topic}/set/color`,
       RGBToHex(this.rgb.r, this.rgb.g, this.rgb.b),

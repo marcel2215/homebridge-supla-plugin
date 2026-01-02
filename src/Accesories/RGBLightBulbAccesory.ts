@@ -77,6 +77,9 @@ export class RGBLightAccesory {
   }
 
   async handleOnSet(value: CharacteristicValue) {
+    this.platform.log.debug(
+      `Publishing ${this.context.topic}/set/on = ${value.toString()}`,
+    );
     this.platform.MqttClient.client.publish(
       `${this.context.topic}/set/on`,
       value.toString());
@@ -87,6 +90,9 @@ export class RGBLightAccesory {
   }
 
   async handleBrightnessSet(value: CharacteristicValue) {
+    this.platform.log.debug(
+      `Publishing ${this.context.topic}/set/color_brightness = ${value.toString()}`,
+    );
     this.platform.MqttClient.client.publish(
       `${this.context.topic}/set/color_brightness`,
       value.toString());
@@ -99,6 +105,9 @@ export class RGBLightAccesory {
   async handleHueSet(value: CharacteristicValue) {
     this.hsv.h = value as number;
     this.rgb = HSVtoRGB(this.hsv.h, this.hsv.s, this.hsv.v);
+    this.platform.log.debug(
+      `Publishing ${this.context.topic}/set/color = ${RGBToHex(this.rgb.r, this.rgb.g, this.rgb.b)}`,
+    );
     this.platform.MqttClient.client.publish(
       `${this.context.topic}/set/color`,
       RGBToHex(this.rgb.r, this.rgb.g, this.rgb.b));
@@ -111,6 +120,9 @@ export class RGBLightAccesory {
   async handleSaturationSet(value: CharacteristicValue) {
     this.hsv.s = value as number;
     this.rgb = HSVtoRGB(this.hsv.h, this.hsv.s, this.hsv.v);
+    this.platform.log.debug(
+      `Publishing ${this.context.topic}/set/color = ${RGBToHex(this.rgb.r, this.rgb.g, this.rgb.b)}`,
+    );
     this.platform.MqttClient.client.publish(
       `${this.context.topic}/set/color`,
       RGBToHex(this.rgb.r, this.rgb.g, this.rgb.b));

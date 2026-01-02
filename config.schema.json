@@ -15,7 +15,7 @@
     },
     "port": {
         "title": "Port",
-        "type": "string",
+        "type": "number",
         "default": 8883
     },
     "protocol": {
@@ -27,6 +27,11 @@
       "title": "TLS",
       "type": "boolean",
       "default": true
+    },
+    "includeHidden": {
+      "title": "Include Hidden Channels",
+      "type": "boolean",
+      "default": false
     },
     "username": {
       "title": "Username",

@@ -34,6 +34,9 @@ export class ActionTriggerAccessory {
         return;
       }
       const event = this.parseEvent(message.toString());
+      this.platform.log.debug(
+        `Action trigger ${this.context.channelCaption} event=${event}`,
+      );
       this.service.updateCharacteristic(this.platform.Characteristic.ProgrammableSwitchEvent, event);
     });
   }

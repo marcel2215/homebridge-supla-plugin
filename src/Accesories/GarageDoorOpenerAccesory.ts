@@ -61,10 +61,16 @@ export class GarageDoorOpenerAccesory {
 
   async handleTargetDoorStateSet() {
     if (this.state === this.platform.Characteristic.CurrentDoorState.CLOSED) {
+      this.platform.log.debug(
+        `Publishing ${this.context.topic}/execute_action = open`,
+      );
       this.platform.MqttClient.client.publish(
         `${this.context.topic}/execute_action`,
         'open');
     } else {
+      this.platform.log.debug(
+        `Publishing ${this.context.topic}/execute_action = close`,
+      );
       this.platform.MqttClient.client.publish(
         `${this.context.topic}/execute_action`,
         'close');

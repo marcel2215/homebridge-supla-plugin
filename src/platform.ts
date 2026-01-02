@@ -54,6 +54,8 @@ export class SuplaPlatform implements DynamicPlatformPlugin {
         this.persistChannels(channels);
         this.discoverDevices(channels);
         this.log.info('Channels discovered and saved to config file');
+      }).catch((error) => {
+        this.log.error(`Channel discovery failed: ${error.message}`);
       });
     });
   }
@@ -78,6 +80,9 @@ export class SuplaPlatform implements DynamicPlatformPlugin {
     const rawChannels = channelsOverride ?? this.loadChannelsFromConfig();
     const channels = rawChannels.map(channel => this.normalizeChannelContext(channel));
     this.log.info('Channels discovered:', channels.length);
+    this.log.debug(
+      `Discovery mode: ${channelsOverride ? 'live' : 'cached'} channels`,
+    );
     const channelUuids = new Set(channels.map(channel => this.getChannelUuid(channel)));
     const shouldPrune = channelsOverride !== undefined && channels.length > 0;
 
@@ -89,11 +94,19 @@ export class SuplaPlatform implements DynamicPlatformPlugin {
       if (existingAccessory) {
         this.log.info('Restoring existing accessory from cache:', existingAccessory.displayName);
         existingAccessory.context.device = channel;
+        this.log.debug(
+          `Restoring channel ${channel.channelCaption} (${channel.deviceId}/${channel.channelId}) ` +
+          `function=${channel.channelFunction} type=${channel.channelType}`,
+        );
         this.setupAccessory(channel, existingAccessory);
         continue;
       }
 
       this.log.info('Adding new accessory:', channel.channelCaption);
+      this.log.debug(
+        `Registering channel ${channel.channelCaption} (${channel.deviceId}/${channel.channelId}) ` +
+        `function=${channel.channelFunction} type=${channel.channelType}`,
+      );
 
       const accessory = new this.api.platformAccessory(channel.channelCaption, uuid);
       accessory.context.device = channel;
@@ -119,6 +132,7 @@ export class SuplaPlatform implements DynamicPlatformPlugin {
   private loadChannelsFromConfig(): Array<SuplaChannelContext> {
     const rawChannels = (this.config as unknown as {channels?: unknown}).channels;
     if (!rawChannels) {
+      this.log.debug('No cached channels found in config.');
       return [];
     }
     if (Array.isArray(rawChannels)) {
@@ -128,22 +142,29 @@ export class SuplaPlatform implements DynamicPlatformPlugin {
       try {
         return JSON.parse(rawChannels) as Array<SuplaChannelContext>;
       } catch (e) {
+        this.log.warn(`Failed to parse cached channels: ${(e as Error).message}`);
         return [];
       }
     }
+    this.log.warn('Cached channels format is invalid; expected string or array.');
     return [];
   }
 
   private persistChannels(channels: Array<SuplaChannelContext>) {
-    const configPath = this.api.user.configPath();
-    const config = JSON.parse(fs.readFileSync(configPath).toString());
-    const platformConfig = config.platforms?.find((platform) => platform.platform === 'SuplaPlatform');
-    if (!platformConfig) {
-      this.log.warn('Failed to save channels: SuplaPlatform not found in config.');
-      return;
+    try {
+      const configPath = this.api.user.configPath();
+      const config = JSON.parse(fs.readFileSync(configPath).toString());
+      const platformConfig = config.platforms?.find((platform) => platform.platform === 'SuplaPlatform');
+      if (!platformConfig) {
+        this.log.warn('Failed to save channels: SuplaPlatform not found in config.');
+        return;
+      }
+      platformConfig.channels = JSON.stringify(channels);
+      fs.writeFileSync(configPath, JSON.stringify(config, null, 2));
+      this.log.debug(`Saved ${channels.length} channels to config.`);
+    } catch (error) {
+      this.log.error(`Failed to save channels: ${(error as Error).message}`);
     }
-    platformConfig.channels = JSON.stringify(channels);
-    fs.writeFileSync(configPath, JSON.stringify(config, null, 2));
   }
 
   private normalizeChannelContext(channel: SuplaChannelContext): SuplaChannelContext {
@@ -168,6 +189,9 @@ export class SuplaPlatform implements DynamicPlatformPlugin {
     const channelFunction = channel.channelFunction || 'UNKNOWN';
     const mqttContext = this.config as unknown as SuplaMqttClientContext;
     const baseTopic = topic || `supla/${mqttContext.username}/devices/${deviceId}/channels/${channelId}`;
+    if (deviceId === 'unknown' || channelId === 'unknown') {
+      this.log.warn(`Channel missing device/channel id for topic ${topic}`);
+    }
     return new SuplaChannelContext(
       baseTopic,
       channelType,
@@ -186,6 +210,10 @@ export class SuplaPlatform implements DynamicPlatformPlugin {
   }
 
   private setupAccessory(channel: SuplaChannelContext, accessory: PlatformAccessory): boolean {
+    this.log.debug(
+      `Mapping channel ${channel.channelCaption} (${channel.deviceId}/${channel.channelId}) ` +
+      `function=${channel.channelFunction} type=${channel.channelType}`,
+    );
     switch (channel.channelFunction) {
       case 'CONTROLLINGTHEGARAGEDOOR':
       case 'CONTROLLINGTHEGATE':

@@ -122,6 +122,9 @@ export class ThermostatAccessory {
   async handleTargetTemperatureSet(value: CharacteristicValue) {
     const target = this.clamp(value as number, 5, 35);
     this.targetTemperature = target;
+    this.platform.log.debug(
+      `Publishing ${this.context.topic}/set/temperature_setpoint = ${target.toString()}`,
+    );
     this.platform.MqttClient.client.publish(
       `${this.context.topic}/set/temperature_setpoint`,
       target.toString(),
@@ -140,11 +143,20 @@ export class ThermostatAccessory {
     const state = value as number;
     this.targetState = state;
     if (state === this.platform.Characteristic.TargetHeatingCoolingState.OFF) {
+      this.platform.log.debug(
+        `Publishing ${this.context.topic}/set/is_on = false`,
+      );
       this.platform.MqttClient.client.publish(`${this.context.topic}/set/is_on`, 'false');
       return;
     }
     const mode = this.fromTargetState(state);
+    this.platform.log.debug(
+      `Publishing ${this.context.topic}/set/is_on = true`,
+    );
     this.platform.MqttClient.client.publish(`${this.context.topic}/set/is_on`, 'true');
+    this.platform.log.debug(
+      `Publishing ${this.context.topic}/set/mode = ${mode}`,
+    );
     this.platform.MqttClient.client.publish(`${this.context.topic}/set/mode`, mode);
   }
 

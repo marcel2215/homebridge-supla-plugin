@@ -52,6 +52,9 @@ export class WicketAccesory {
   }
 
   async handleTargetDoorStateSet() {
+    this.platform.log.debug(
+      `Publishing ${this.context.topic}/execute_action = open`,
+    );
     this.platform.MqttClient.client.publish(
       `${this.context.topic}/execute_action`,
       'open');
