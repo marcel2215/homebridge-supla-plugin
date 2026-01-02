@@ -1,6 +1,6 @@
 {
   "displayName": "Supla Plugin",
-  "name": "homebridge-supla-plugin",
+  "name": "@marcel2215/homebridge-supla-plugin",
   "version": "2.1.5",
   "description": "Plugin for Homebridge to control Supla devices",
   "license": "Apache-2.0",

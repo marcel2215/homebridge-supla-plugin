@@ -6,4 +6,4 @@ export const PLATFORM_NAME = 'SuplaPlatform';
 /**
  * This must match the name of your plugin as defined the package.json
  */
-export const PLUGIN_NAME = 'homebridge-supla-plugin';
+export const PLUGIN_NAME = '@marcel2215/homebridge-supla-plugin';
