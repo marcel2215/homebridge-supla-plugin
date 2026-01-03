@@ -1,5 +1,6 @@
 # Ignore source code
 src
+mqtt-example-dumps/
 
 # ------------- Defaults ------------- #
 
