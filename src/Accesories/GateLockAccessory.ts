@@ -49,6 +49,7 @@ export class GateLockAccessory {
         this.service.updateCharacteristic(this.platform.Characteristic.LockCurrentState, this.currentState);
         this.service.updateCharacteristic(this.platform.Characteristic.LockTargetState, this.targetState);
       },
+      this.accessory.UUID,
     );
     this.platform.registerMqttHandler(
       `${this.context.topic}/state/connected`,
@@ -59,6 +60,7 @@ export class GateLockAccessory {
           this.connected ? 0 : 1,
         );
       },
+      this.accessory.UUID,
     );
   }
 
@@ -90,11 +92,11 @@ export class GateLockAccessory {
       const offPayload = this.platform.getGateLockSetOffPayload();
       const pulseSeconds = this.platform.getGateLockPulseSeconds();
       this.platform.log.debug(`Publishing ${topic} = ${onPayload}`);
-      this.platform.MqttClient.client.publish(topic, onPayload);
+      this.platform.publishCommand(topic, onPayload);
       if (pulseSeconds > 0) {
         this.pulseTimer = setTimeout(() => {
           this.platform.log.debug(`Publishing ${topic} = ${offPayload} (auto-off)`);
-          this.platform.MqttClient.client.publish(topic, offPayload);
+          this.platform.publishCommand(topic, offPayload);
         }, Math.round(pulseSeconds * 1000));
       } else {
         this.platform.log.warn(
@@ -112,7 +114,7 @@ export class GateLockAccessory {
       return;
     }
     this.platform.log.debug(`Publishing ${this.context.topic}/execute_action = ${action}`);
-    this.platform.MqttClient.client.publish(
+    this.platform.publishCommand(
       `${this.context.topic}/execute_action`,
       action,
     );

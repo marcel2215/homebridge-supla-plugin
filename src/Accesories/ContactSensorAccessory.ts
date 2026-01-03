@@ -33,6 +33,7 @@ export class ContactSensorAccessory {
           : this.platform.Characteristic.ContactSensorState.CONTACT_NOT_DETECTED;
         this.service.updateCharacteristic(this.platform.Characteristic.ContactSensorState, this.state);
       },
+      this.accessory.UUID,
     );
     this.platform.registerMqttHandler(
       `${this.context.topic}/state/connected`,
@@ -43,6 +44,7 @@ export class ContactSensorAccessory {
           this.connected ? 0 : 1,
         );
       },
+      this.accessory.UUID,
     );
   }
 

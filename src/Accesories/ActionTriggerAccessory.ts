@@ -29,6 +29,7 @@ export class ActionTriggerAccessory {
         );
         this.service.updateCharacteristic(this.platform.Characteristic.ProgrammableSwitchEvent, event);
       },
+      this.accessory.UUID,
     );
     this.platform.registerMqttHandler(
       `${this.context.topic}/state/connected`,
@@ -39,6 +40,7 @@ export class ActionTriggerAccessory {
           this.connected ? 0 : 1,
         );
       },
+      this.accessory.UUID,
     );
   }
 

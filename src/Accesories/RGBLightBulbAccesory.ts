@@ -47,6 +47,7 @@ export class RGBLightAccesory {
         this.state = this.platform.parseBoolean(message.toString());
         this.service.updateCharacteristic(this.platform.Characteristic.On, this.state);
       },
+      this.accessory.UUID,
     );
     this.platform.registerMqttHandler(
       `${this.context.topic}/state/color`,
@@ -55,6 +56,7 @@ export class RGBLightAccesory {
         this.hsv = RGBtoHSV(this.rgb.r, this.rgb.g, this.rgb.b);
         this.updateColor();
       },
+      this.accessory.UUID,
     );
     this.platform.registerMqttHandler(
       `${this.context.topic}/state/color_brightness`,
@@ -62,6 +64,7 @@ export class RGBLightAccesory {
         this.hsv.v = parseInt(message.toString(), 10);
         this.updateColor();
       },
+      this.accessory.UUID,
     );
     this.platform.registerMqttHandler(
       `${this.context.topic}/state/connected`,
@@ -72,6 +75,7 @@ export class RGBLightAccesory {
           this.connected ? 0 : 1,
         );
       },
+      this.accessory.UUID,
     );
   }
 
@@ -83,7 +87,7 @@ export class RGBLightAccesory {
     this.platform.log.debug(
       `Publishing ${this.context.topic}/set/on = ${value.toString()}`,
     );
-    this.platform.MqttClient.client.publish(
+    this.platform.publishCommand(
       `${this.context.topic}/set/on`,
       value.toString());
   }
@@ -96,7 +100,7 @@ export class RGBLightAccesory {
     this.platform.log.debug(
       `Publishing ${this.context.topic}/set/color_brightness = ${value.toString()}`,
     );
-    this.platform.MqttClient.client.publish(
+    this.platform.publishCommand(
       `${this.context.topic}/set/color_brightness`,
       value.toString());
   }
@@ -111,7 +115,7 @@ export class RGBLightAccesory {
     this.platform.log.debug(
       `Publishing ${this.context.topic}/set/color = ${RGBToHex(this.rgb.r, this.rgb.g, this.rgb.b)}`,
     );
-    this.platform.MqttClient.client.publish(
+    this.platform.publishCommand(
       `${this.context.topic}/set/color`,
       RGBToHex(this.rgb.r, this.rgb.g, this.rgb.b));
   }
@@ -126,7 +130,7 @@ export class RGBLightAccesory {
     this.platform.log.debug(
       `Publishing ${this.context.topic}/set/color = ${RGBToHex(this.rgb.r, this.rgb.g, this.rgb.b)}`,
     );
-    this.platform.MqttClient.client.publish(
+    this.platform.publishCommand(
       `${this.context.topic}/set/color`,
       RGBToHex(this.rgb.r, this.rgb.g, this.rgb.b));
   }

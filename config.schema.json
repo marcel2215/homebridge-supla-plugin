@@ -156,6 +156,21 @@
       "type": "number",
       "default": 0
     },
+    "commandQos": {
+      "title": "Command QoS",
+      "type": "number",
+      "default": 0,
+      "enum": [
+        0,
+        1,
+        2
+      ]
+    },
+    "commandRetain": {
+      "title": "Command Retain",
+      "type": "boolean",
+      "default": false
+    },
     "username": {
       "title": "Username",
       "type": "string",

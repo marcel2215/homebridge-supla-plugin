@@ -37,6 +37,7 @@ export class AirQualityAccessory {
           this.updateMeasurements();
         }
       },
+      this.accessory.UUID,
     );
     this.platform.registerMqttHandler(
       `${this.context.topic}/state/connected`,
@@ -47,6 +48,7 @@ export class AirQualityAccessory {
           this.connected ? 0 : 1,
         );
       },
+      this.accessory.UUID,
     );
   }
 

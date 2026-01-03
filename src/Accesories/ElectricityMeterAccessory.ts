@@ -45,6 +45,7 @@ export class ElectricityMeterAccessory {
           this.connected ? 0 : 1,
         );
       },
+      this.accessory.UUID,
     );
     this.metricPriority.forEach((key, metricIndex) => {
       this.platform.registerMqttHandler(
@@ -63,6 +64,7 @@ export class ElectricityMeterAccessory {
             );
           }
         },
+        this.accessory.UUID,
       );
     });
   }

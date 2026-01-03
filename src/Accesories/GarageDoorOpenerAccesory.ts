@@ -41,6 +41,7 @@ export class GarageDoorOpenerAccesory {
               : this.platform.Characteristic.CurrentDoorState.OPEN;
             this.service.updateCharacteristic(this.platform.Characteristic.CurrentDoorState, this.state);
           },
+          this.accessory.UUID,
         );
         this.platform.registerMqttHandler(
           `${this.context.topic}/state/connected`,
@@ -51,6 +52,7 @@ export class GarageDoorOpenerAccesory {
               this.connected ? 0 : 1,
             );
           },
+          this.accessory.UUID,
         );
   }
 
@@ -67,14 +69,14 @@ export class GarageDoorOpenerAccesory {
       this.platform.log.debug(
         `Publishing ${this.context.topic}/execute_action = open`,
       );
-      this.platform.MqttClient.client.publish(
+      this.platform.publishCommand(
         `${this.context.topic}/execute_action`,
         'open');
     } else {
       this.platform.log.debug(
         `Publishing ${this.context.topic}/execute_action = close`,
       );
-      this.platform.MqttClient.client.publish(
+      this.platform.publishCommand(
         `${this.context.topic}/execute_action`,
         'close');
     }

@@ -40,6 +40,7 @@ export class WicketAccesory {
               this.connected ? 0 : 1,
             );
           },
+          this.accessory.UUID,
         );
   }
 
@@ -55,7 +56,7 @@ export class WicketAccesory {
     this.platform.log.debug(
       `Publishing ${this.context.topic}/execute_action = open`,
     );
-    this.platform.MqttClient.client.publish(
+    this.platform.publishCommand(
       `${this.context.topic}/execute_action`,
       'open');
     this.service.updateCharacteristic(

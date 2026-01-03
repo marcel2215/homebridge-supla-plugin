@@ -36,6 +36,7 @@ export class PressureAccessory {
           );
         }
       },
+      this.accessory.UUID,
     );
     this.platform.registerMqttHandler(
       `${this.context.topic}/state/connected`,
@@ -46,6 +47,7 @@ export class PressureAccessory {
           this.connected ? 0 : 1,
         );
       },
+      this.accessory.UUID,
     );
   }
 

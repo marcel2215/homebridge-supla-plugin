@@ -44,6 +44,7 @@ export class DoorAccessory {
         this.hi = this.platform.parseBoolean(message.toString());
         this.updatePositionsFromState();
       },
+      this.accessory.UUID,
     );
     this.platform.registerMqttHandler(
       `${this.context.topic}/state/partial_hi`,
@@ -51,6 +52,7 @@ export class DoorAccessory {
         this.partialHi = this.platform.parseBoolean(message.toString());
         this.updatePositionsFromState();
       },
+      this.accessory.UUID,
     );
     this.platform.registerMqttHandler(
       `${this.context.topic}/state/connected`,
@@ -61,6 +63,7 @@ export class DoorAccessory {
           this.connected ? 0 : 1,
         );
       },
+      this.accessory.UUID,
     );
   }
 
@@ -87,7 +90,7 @@ export class DoorAccessory {
 
     const action = this.targetPosition <= 10 ? 'close' : 'open';
     this.platform.log.debug(`Publishing ${this.context.topic}/execute_action = ${action}`);
-    this.platform.MqttClient.client.publish(
+    this.platform.publishCommand(
       `${this.context.topic}/execute_action`,
       action,
     );

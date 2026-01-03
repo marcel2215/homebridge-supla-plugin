@@ -32,6 +32,7 @@ export class SwitchAccessory {
         this.state = this.platform.parseBoolean(message.toString());
         this.service.updateCharacteristic(this.platform.Characteristic.On, this.state);
       },
+      this.accessory.UUID,
     );
     this.platform.registerMqttHandler(
       `${this.context.topic}/state/connected`,
@@ -39,6 +40,7 @@ export class SwitchAccessory {
         this.connected = this.platform.parseBoolean(message.toString());
         this.updateFault();
       },
+      this.accessory.UUID,
     );
     this.platform.registerMqttHandler(
       `${this.context.topic}/state/overcurrent_relay_off`,
@@ -46,6 +48,7 @@ export class SwitchAccessory {
         this.overcurrent = this.platform.parseBoolean(message.toString());
         this.updateFault();
       },
+      this.accessory.UUID,
     );
   }
 
@@ -57,7 +60,7 @@ export class SwitchAccessory {
     this.platform.log.debug(
       `Publishing ${this.context.topic}/set/on = ${value.toString()}`,
     );
-    this.platform.MqttClient.client.publish(
+    this.platform.publishCommand(
       `${this.context.topic}/set/on`,
       value.toString(),
     );

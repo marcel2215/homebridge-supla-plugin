@@ -55,7 +55,10 @@ export class SuplaPlatform implements DynamicPlatformPlugin {
   private readonly gateLockPulseSeconds: number;
   private readonly gateLockSetOnPayload: string;
   private readonly gateLockSetOffPayload: string;
+  private readonly commandQos: 0 | 1 | 2;
+  private readonly commandRetain: boolean;
   private readonly mqttHandlers = new Map<string, Set<(message: Buffer, topic: string) => void>>();
+  private readonly mqttHandlerOwners = new Map<string, Map<string, Set<(message: Buffer, topic: string) => void>>>();
   private readonly mqttSubscriptions = new Set<string>();
   private mqttRouterAttached = false;
 
@@ -83,6 +86,8 @@ export class SuplaPlatform implements DynamicPlatformPlugin {
       gateLockPulseSeconds?: number;
       gateLockSetOnPayload?: string;
       gateLockSetOffPayload?: string;
+      commandQos?: number;
+      commandRetain?: boolean | string;
     };
     this.coveringControlMode = this.normalizeCoveringControlMode(configView.coveringControlMode);
     this.coveringSetTopicSuffix = this.normalizeTopicSuffix(configView.coveringSetTopicSuffix || 'set/closing_percentage');
@@ -101,6 +106,8 @@ export class SuplaPlatform implements DynamicPlatformPlugin {
     this.gateLockPulseSeconds = Number(configView.gateLockPulseSeconds) || 0;
     this.gateLockSetOnPayload = (configView.gateLockSetOnPayload ?? 'true').toString();
     this.gateLockSetOffPayload = (configView.gateLockSetOffPayload ?? 'false').toString();
+    this.commandQos = this.normalizeCommandQos(configView.commandQos);
+    this.commandRetain = this.parseBoolean(configView.commandRetain ?? false);
 
     this.api.on('didFinishLaunching', () => {
       log.debug('Executed didFinishLaunching callback');
@@ -178,6 +185,7 @@ export class SuplaPlatform implements DynamicPlatformPlugin {
       const accessoriesToRemove = this.accessories.filter(accessory => !channelUuids.has(accessory.UUID));
       for (const accessory of accessoriesToRemove) {
         this.log.info('Removing existing accessory from cache:', accessory.displayName);
+        this.unregisterMqttHandlers(accessory.UUID);
         this.api.unregisterPlatformAccessories(PLUGIN_NAME, PLATFORM_NAME, [accessory]);
         const index = this.accessories.indexOf(accessory);
         if (index !== -1) {
@@ -268,6 +276,7 @@ export class SuplaPlatform implements DynamicPlatformPlugin {
   }
 
   private setupAccessory(channel: SuplaChannelContext, accessory: PlatformAccessory): boolean {
+    this.unregisterMqttHandlers(accessory.UUID);
     this.log.debug(
       `Mapping channel ${channel.channelCaption} (${channel.deviceId}/${channel.channelId}) ` +
       `function=${channel.channelFunction} type=${channel.channelType}`,
@@ -486,7 +495,11 @@ export class SuplaPlatform implements DynamicPlatformPlugin {
     return value.toString().replace(/^\/+/, '');
   }
 
-  public registerMqttHandler(topic: string, handler: (message: Buffer, topic: string) => void): () => void {
+  public registerMqttHandler(
+    topic: string,
+    handler: (message: Buffer, topic: string) => void,
+    ownerId?: string,
+  ): () => void {
     if (!topic) {
       return () => undefined;
     }
@@ -494,6 +507,13 @@ export class SuplaPlatform implements DynamicPlatformPlugin {
     const handlers = this.mqttHandlers.get(topic) ?? new Set();
     handlers.add(handler);
     this.mqttHandlers.set(topic, handlers);
+    if (ownerId) {
+      const ownerTopics = this.mqttHandlerOwners.get(ownerId) ?? new Map();
+      const ownerHandlers = ownerTopics.get(topic) ?? new Set();
+      ownerHandlers.add(handler);
+      ownerTopics.set(topic, ownerHandlers);
+      this.mqttHandlerOwners.set(ownerId, ownerTopics);
+    }
     if (!this.mqttSubscriptions.has(topic)) {
       this.MqttClient.client.subscribe(topic, (err) => {
         if (err) {
@@ -508,6 +528,19 @@ export class SuplaPlatform implements DynamicPlatformPlugin {
         return;
       }
       active.delete(handler);
+      if (ownerId) {
+        const ownerTopics = this.mqttHandlerOwners.get(ownerId);
+        const ownerHandlers = ownerTopics?.get(topic);
+        if (ownerHandlers) {
+          ownerHandlers.delete(handler);
+          if (ownerHandlers.size === 0) {
+            ownerTopics?.delete(topic);
+          }
+        }
+        if (ownerTopics && ownerTopics.size === 0) {
+          this.mqttHandlerOwners.delete(ownerId);
+        }
+      }
       if (active.size === 0) {
         this.mqttHandlers.delete(topic);
         if (this.mqttSubscriptions.has(topic)) {
@@ -520,6 +553,51 @@ export class SuplaPlatform implements DynamicPlatformPlugin {
         }
       }
     };
+  }
+
+  private unregisterMqttHandlers(ownerId: string) {
+    const ownerTopics = this.mqttHandlerOwners.get(ownerId);
+    if (!ownerTopics) {
+      return;
+    }
+    for (const [topic, handlers] of ownerTopics) {
+      const active = this.mqttHandlers.get(topic);
+      if (!active) {
+        continue;
+      }
+      for (const handler of handlers) {
+        active.delete(handler);
+      }
+      if (active.size === 0) {
+        this.mqttHandlers.delete(topic);
+        if (this.mqttSubscriptions.has(topic)) {
+          this.MqttClient.client.unsubscribe(topic, (err) => {
+            if (err) {
+              this.log.error(`MQTT unsubscribe failed for ${topic}: ${err.message}`);
+            }
+          });
+          this.mqttSubscriptions.delete(topic);
+        }
+      }
+    }
+    this.mqttHandlerOwners.delete(ownerId);
+  }
+
+  public publishCommand(topic: string, payload: string | Buffer, callback?: (error?: Error) => void) {
+    this.MqttClient.client.publish(
+      topic,
+      payload,
+      { qos: this.commandQos, retain: this.commandRetain },
+      (error) => {
+        if (callback) {
+          callback(error);
+          return;
+        }
+        if (error) {
+          this.log.error(`Publish failed for ${topic}: ${error.message}`);
+        }
+      },
+    );
   }
 
   public parseBoolean(value: unknown): boolean {
@@ -537,6 +615,14 @@ export class SuplaPlatform implements DynamicPlatformPlugin {
         || normalized === 'yes';
     }
     return false;
+  }
+
+  private normalizeCommandQos(value?: number): 0 | 1 | 2 {
+    const parsed = Number(value);
+    if (parsed === 1 || parsed === 2) {
+      return parsed;
+    }
+    return 0;
   }
 
   private startMqttRouter() {

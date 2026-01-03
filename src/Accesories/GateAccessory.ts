@@ -43,6 +43,7 @@ export class GateAccessory {
         this.hi = this.platform.parseBoolean(message.toString());
         this.updateStates();
       },
+      this.accessory.UUID,
     );
     this.platform.registerMqttHandler(
       `${this.context.topic}/state/partial_hi`,
@@ -50,6 +51,7 @@ export class GateAccessory {
         this.partialHi = this.platform.parseBoolean(message.toString());
         this.updateStates();
       },
+      this.accessory.UUID,
     );
     this.platform.registerMqttHandler(
       `${this.context.topic}/state/connected`,
@@ -60,6 +62,7 @@ export class GateAccessory {
           this.connected ? 0 : 1,
         );
       },
+      this.accessory.UUID,
     );
   }
 
@@ -90,7 +93,7 @@ export class GateAccessory {
       return;
     }
     this.platform.log.debug(`Publishing ${this.context.topic}/execute_action = ${action}`);
-    this.platform.MqttClient.client.publish(
+    this.platform.publishCommand(
       `${this.context.topic}/execute_action`,
       action,
     );

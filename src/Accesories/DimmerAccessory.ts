@@ -39,6 +39,7 @@ export class DimmerAccessory {
         this.state = this.platform.parseBoolean(message.toString());
         this.service.updateCharacteristic(this.platform.Characteristic.On, this.state);
       },
+      this.accessory.UUID,
     );
     this.platform.registerMqttHandler(
       `${this.context.topic}/state/brightness`,
@@ -47,6 +48,7 @@ export class DimmerAccessory {
         this.brightness = parseInt(message.toString(), 10);
         this.service.updateCharacteristic(this.platform.Characteristic.Brightness, this.brightness);
       },
+      this.accessory.UUID,
     );
     this.platform.registerMqttHandler(
       `${this.context.topic}/state/connected`,
@@ -54,6 +56,7 @@ export class DimmerAccessory {
         this.connected = this.platform.parseBoolean(message.toString());
         this.updateFault();
       },
+      this.accessory.UUID,
     );
     this.platform.registerMqttHandler(
       `${this.context.topic}/state/overcurrent_relay_off`,
@@ -61,6 +64,7 @@ export class DimmerAccessory {
         this.overcurrent = this.platform.parseBoolean(message.toString());
         this.updateFault();
       },
+      this.accessory.UUID,
     );
   }
 
@@ -72,7 +76,7 @@ export class DimmerAccessory {
     this.platform.log.debug(
       `Publishing ${this.context.topic}/set/on = ${value.toString()}`,
     );
-    this.platform.MqttClient.client.publish(
+    this.platform.publishCommand(
       `${this.context.topic}/set/on`,
       value.toString());
     setTimeout(() => {
@@ -88,7 +92,7 @@ export class DimmerAccessory {
     this.platform.log.debug(
       `Publishing ${this.context.topic}/set/brightness = ${value.toString()}`,
     );
-    this.platform.MqttClient.client.publish(
+    this.platform.publishCommand(
       `${this.context.topic}/set/brightness`,
       value.toString());
   }

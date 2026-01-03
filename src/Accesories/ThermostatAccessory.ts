@@ -56,6 +56,7 @@ export class ThermostatAccessory {
           }
         }
       },
+      this.accessory.UUID,
     );
     this.platform.registerMqttHandler(
       `${this.context.topic}/state/temperature`,
@@ -70,6 +71,7 @@ export class ThermostatAccessory {
           );
         }
       },
+      this.accessory.UUID,
     );
     this.platform.registerMqttHandler(
       `${this.context.topic}/state/mode`,
@@ -81,6 +83,7 @@ export class ThermostatAccessory {
           this.targetState,
         );
       },
+      this.accessory.UUID,
     );
     this.platform.registerMqttHandler(
       `${this.context.topic}/state/action`,
@@ -92,6 +95,7 @@ export class ThermostatAccessory {
           this.currentState,
         );
       },
+      this.accessory.UUID,
     );
     this.platform.registerMqttHandler(
       `${this.context.topic}/state/is_on`,
@@ -108,6 +112,7 @@ export class ThermostatAccessory {
           this.currentState,
         );
       },
+      this.accessory.UUID,
     );
     this.platform.registerMqttHandler(
       `${this.context.topic}/state/connected`,
@@ -118,6 +123,7 @@ export class ThermostatAccessory {
           this.connected ? 0 : 1,
         );
       },
+      this.accessory.UUID,
     );
   }
 
@@ -135,7 +141,7 @@ export class ThermostatAccessory {
     this.platform.log.debug(
       `Publishing ${this.context.topic}/set/temperature_setpoint = ${target.toString()}`,
     );
-    this.platform.MqttClient.client.publish(
+    this.platform.publishCommand(
       `${this.context.topic}/set/temperature_setpoint`,
       target.toString(),
     );
@@ -156,18 +162,18 @@ export class ThermostatAccessory {
       this.platform.log.debug(
         `Publishing ${this.context.topic}/set/is_on = false`,
       );
-      this.platform.MqttClient.client.publish(`${this.context.topic}/set/is_on`, 'false');
+      this.platform.publishCommand(`${this.context.topic}/set/is_on`, 'false');
       return;
     }
     const mode = this.fromTargetState(state);
     this.platform.log.debug(
       `Publishing ${this.context.topic}/set/is_on = true`,
     );
-    this.platform.MqttClient.client.publish(`${this.context.topic}/set/is_on`, 'true');
+    this.platform.publishCommand(`${this.context.topic}/set/is_on`, 'true');
     this.platform.log.debug(
       `Publishing ${this.context.topic}/set/mode = ${mode}`,
     );
-    this.platform.MqttClient.client.publish(`${this.context.topic}/set/mode`, mode);
+    this.platform.publishCommand(`${this.context.topic}/set/mode`, mode);
   }
 
   private toTargetState(

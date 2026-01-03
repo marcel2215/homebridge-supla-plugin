@@ -43,6 +43,7 @@ export class ValveAccessory {
         this.service.updateCharacteristic(this.platform.Characteristic.Active, this.active);
         this.service.updateCharacteristic(this.platform.Characteristic.InUse, this.inUse);
       },
+      this.accessory.UUID,
     );
     this.platform.registerMqttHandler(
       `${this.context.topic}/state/flooding`,
@@ -53,6 +54,7 @@ export class ValveAccessory {
           this.flooding ? 1 : 0,
         );
       },
+      this.accessory.UUID,
     );
     this.platform.registerMqttHandler(
       `${this.context.topic}/state/connected`,
@@ -63,6 +65,7 @@ export class ValveAccessory {
           this.connected && !this.flooding ? 0 : 1,
         );
       },
+      this.accessory.UUID,
     );
   }
 
@@ -75,7 +78,7 @@ export class ValveAccessory {
     this.platform.log.debug(
       `Publishing ${this.context.topic}/set/closed = ${(!active).toString()}`,
     );
-    this.platform.MqttClient.client.publish(
+    this.platform.publishCommand(
       `${this.context.topic}/set/closed`,
       (!active).toString(),
     );

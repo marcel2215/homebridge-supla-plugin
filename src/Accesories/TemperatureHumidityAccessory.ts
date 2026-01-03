@@ -42,6 +42,7 @@ export class TemperatureHumidityAccessory {
           );
         }
       },
+      this.accessory.UUID,
     );
     this.platform.registerMqttHandler(
       `${this.context.topic}/state/humidity`,
@@ -55,6 +56,7 @@ export class TemperatureHumidityAccessory {
           );
         }
       },
+      this.accessory.UUID,
     );
     this.platform.registerMqttHandler(
       `${this.context.topic}/state/connected`,
@@ -70,6 +72,7 @@ export class TemperatureHumidityAccessory {
           faultValue,
         );
       },
+      this.accessory.UUID,
     );
   }
 

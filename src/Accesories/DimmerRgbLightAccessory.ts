@@ -49,6 +49,7 @@ export class DimmerRgbLightAccessory {
         this.state = this.platform.parseBoolean(message.toString());
         this.service.updateCharacteristic(this.platform.Characteristic.On, this.state);
       },
+      this.accessory.UUID,
     );
     this.platform.registerMqttHandler(
       `${this.context.topic}/state/color`,
@@ -57,6 +58,7 @@ export class DimmerRgbLightAccessory {
         this.hsv = RGBtoHSV(this.rgb.r, this.rgb.g, this.rgb.b);
         this.updateColor();
       },
+      this.accessory.UUID,
     );
     this.platform.registerMqttHandler(
       `${this.context.topic}/state/color_brightness`,
@@ -67,6 +69,7 @@ export class DimmerRgbLightAccessory {
         }
         this.updateColor();
       },
+      this.accessory.UUID,
     );
     this.platform.registerMqttHandler(
       `${this.context.topic}/state/brightness`,
@@ -75,6 +78,7 @@ export class DimmerRgbLightAccessory {
         this.hasDimmerBrightness = true;
         this.service.updateCharacteristic(this.platform.Characteristic.Brightness, this.brightness);
       },
+      this.accessory.UUID,
     );
     this.platform.registerMqttHandler(
       `${this.context.topic}/state/connected`,
@@ -82,6 +86,7 @@ export class DimmerRgbLightAccessory {
         this.connected = this.platform.parseBoolean(message.toString());
         this.updateFault();
       },
+      this.accessory.UUID,
     );
     this.platform.registerMqttHandler(
       `${this.context.topic}/state/overcurrent_relay_off`,
@@ -89,6 +94,7 @@ export class DimmerRgbLightAccessory {
         this.overcurrent = this.platform.parseBoolean(message.toString());
         this.updateFault();
       },
+      this.accessory.UUID,
     );
   }
 
@@ -100,7 +106,7 @@ export class DimmerRgbLightAccessory {
     this.platform.log.debug(
       `Publishing ${this.context.topic}/set/on = ${value.toString()}`,
     );
-    this.platform.MqttClient.client.publish(
+    this.platform.publishCommand(
       `${this.context.topic}/set/on`,
       value.toString(),
     );
@@ -117,14 +123,14 @@ export class DimmerRgbLightAccessory {
     this.platform.log.debug(
       `Publishing ${this.context.topic}/set/brightness = ${target.toString()}`,
     );
-    this.platform.MqttClient.client.publish(
+    this.platform.publishCommand(
       `${this.context.topic}/set/brightness`,
       target.toString(),
     );
     this.platform.log.debug(
       `Publishing ${this.context.topic}/set/color_brightness = ${target.toString()}`,
     );
-    this.platform.MqttClient.client.publish(
+    this.platform.publishCommand(
       `${this.context.topic}/set/color_brightness`,
       target.toString(),
     );
@@ -140,7 +146,7 @@ export class DimmerRgbLightAccessory {
     this.platform.log.debug(
       `Publishing ${this.context.topic}/set/color = ${RGBToHex(this.rgb.r, this.rgb.g, this.rgb.b)}`,
     );
-    this.platform.MqttClient.client.publish(
+    this.platform.publishCommand(
       `${this.context.topic}/set/color`,
       RGBToHex(this.rgb.r, this.rgb.g, this.rgb.b),
     );
@@ -156,7 +162,7 @@ export class DimmerRgbLightAccessory {
     this.platform.log.debug(
       `Publishing ${this.context.topic}/set/color = ${RGBToHex(this.rgb.r, this.rgb.g, this.rgb.b)}`,
     );
-    this.platform.MqttClient.client.publish(
+    this.platform.publishCommand(
       `${this.context.topic}/set/color`,
       RGBToHex(this.rgb.r, this.rgb.g, this.rgb.b),
     );
