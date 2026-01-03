@@ -27,10 +27,10 @@ export class ContactSensorAccessory {
     this.platform.registerMqttHandler(
       `${this.context.topic}/state/hi`,
       (message) => {
-        const open = this.platform.parseBoolean(message.toString());
-        this.state = open
-          ? this.platform.Characteristic.ContactSensorState.CONTACT_NOT_DETECTED
-          : this.platform.Characteristic.ContactSensorState.CONTACT_DETECTED;
+        const closed = this.platform.parseBoolean(message.toString());
+        this.state = closed
+          ? this.platform.Characteristic.ContactSensorState.CONTACT_DETECTED
+          : this.platform.Characteristic.ContactSensorState.CONTACT_NOT_DETECTED;
         this.service.updateCharacteristic(this.platform.Characteristic.ContactSensorState, this.state);
       },
     );
