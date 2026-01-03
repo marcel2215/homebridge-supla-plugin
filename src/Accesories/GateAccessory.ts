@@ -13,6 +13,8 @@ export class GateAccessory {
   private obstructionDetected = false;
   private isClosedSensorActive = false;
   private isPartialSensorActive = false;
+  private hasClosedSensorState = false;
+  private hasPartialSensorState = false;
   private pendingTarget?: number;
   private transitionTimer?: NodeJS.Timeout;
   private readonly transitionTimeoutMs = 60000;
@@ -57,6 +59,7 @@ export class GateAccessory {
       `${this.context.topic}/state/hi`,
       (message) => {
         this.isClosedSensorActive = this.platform.parseBoolean(message.toString());
+        this.hasClosedSensorState = true;
         this.updateStatesFromSensors();
       },
       this.accessory.UUID,
@@ -65,6 +68,7 @@ export class GateAccessory {
       `${this.context.topic}/state/partial_hi`,
       (message) => {
         this.isPartialSensorActive = this.platform.parseBoolean(message.toString());
+        this.hasPartialSensorState = true;
         this.updateStatesFromSensors();
       },
       this.accessory.UUID,
@@ -105,7 +109,8 @@ export class GateAccessory {
       return;
     }
 
-    if (this.isAtTarget(target)) {
+    const mode = this.platform.getGateControlMode();
+    if (mode === 'toggle' && this.isAtTarget(target)) {
       return;
     }
 
@@ -113,7 +118,6 @@ export class GateAccessory {
       return;
     }
 
-    const mode = this.platform.getGateControlMode();
     let action = '';
     if (mode === 'toggle') {
       action = this.platform.getGateExecuteActionToggle();
@@ -221,14 +225,32 @@ export class GateAccessory {
 
   private isAtTarget(target: number): boolean {
     if (target === this.platform.Characteristic.TargetDoorState.CLOSED) {
+      if (!this.hasClosedSensorState) {
+        return false;
+      }
       return this.isClosedSensorActive;
     }
     if (target === this.platform.Characteristic.TargetDoorState.OPEN) {
       if (this.partialHiMode === 'open_endstop') {
+        if (!this.hasPartialSensorState) {
+          return false;
+        }
         return this.isPartialSensorActive;
       }
       if (this.partialHiMode === 'moving' || this.partialHiMode === 'pedestrian_endstop') {
-        return !this.isClosedSensorActive && !this.isPartialSensorActive;
+        if (!this.hasClosedSensorState && !this.hasPartialSensorState) {
+          return false;
+        }
+        if (this.hasClosedSensorState && this.isClosedSensorActive) {
+          return false;
+        }
+        if (this.hasPartialSensorState && this.isPartialSensorActive) {
+          return false;
+        }
+        return true;
+      }
+      if (!this.hasClosedSensorState) {
+        return false;
       }
       return !this.isClosedSensorActive;
     }

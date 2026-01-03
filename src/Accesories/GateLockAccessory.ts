@@ -105,7 +105,8 @@ export class GateLockAccessory {
 
   async handleTargetStateSet(value: CharacteristicValue) {
     const target = value as number;
-    if (target === this.targetState) {
+    const isUnlock = target === this.platform.Characteristic.LockTargetState.UNSECURED;
+    if (target === this.targetState && !isUnlock) {
       return;
     }
     const previousTarget = this.targetState;
@@ -133,9 +134,6 @@ export class GateLockAccessory {
       return;
     }
     this.clearPulseTimer();
-    if (this.pendingTarget === target) {
-      return;
-    }
 
     const mode = this.platform.getGateLockControlMode();
     if (mode === 'set_on_pulse') {
