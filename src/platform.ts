@@ -40,6 +40,10 @@ export class SuplaPlatform implements DynamicPlatformPlugin {
   private readonly coveringControlMode: 'set' | 'execute_action' | 'hybrid';
   private readonly coveringSetTopicSuffix: string;
   private readonly coveringTiltTopicSuffix: string;
+  private readonly coveringExecuteActionOpen: string;
+  private readonly coveringExecuteActionClose: string;
+  private readonly coveringExecuteActionStop: string;
+  private readonly coveringTravelTimeSeconds: number;
 
   constructor(
     public readonly log: Logger,
@@ -51,10 +55,18 @@ export class SuplaPlatform implements DynamicPlatformPlugin {
       coveringControlMode?: string;
       coveringSetTopicSuffix?: string;
       coveringTiltTopicSuffix?: string;
+      coveringExecuteActionOpen?: string;
+      coveringExecuteActionClose?: string;
+      coveringExecuteActionStop?: string;
+      coveringTravelTimeSeconds?: number;
     };
     this.coveringControlMode = this.normalizeCoveringControlMode(configView.coveringControlMode);
-    this.coveringSetTopicSuffix = this.normalizeTopicSuffix(configView.coveringSetTopicSuffix || 'set/shut');
+    this.coveringSetTopicSuffix = this.normalizeTopicSuffix(configView.coveringSetTopicSuffix || 'set/closing_percentage');
     this.coveringTiltTopicSuffix = this.normalizeTopicSuffix(configView.coveringTiltTopicSuffix || 'set/tilt');
+    this.coveringExecuteActionOpen = (configView.coveringExecuteActionOpen || 'reveal').toString();
+    this.coveringExecuteActionClose = (configView.coveringExecuteActionClose || 'shut').toString();
+    this.coveringExecuteActionStop = (configView.coveringExecuteActionStop || 'stop').toString();
+    this.coveringTravelTimeSeconds = Number(configView.coveringTravelTimeSeconds) || 0;
 
     this.api.on('didFinishLaunching', () => {
       log.debug('Executed didFinishLaunching callback');
@@ -348,6 +360,22 @@ export class SuplaPlatform implements DynamicPlatformPlugin {
 
   public getCoveringTiltTopicSuffix(): string {
     return this.coveringTiltTopicSuffix;
+  }
+
+  public getCoveringExecuteActionOpen(): string {
+    return this.coveringExecuteActionOpen;
+  }
+
+  public getCoveringExecuteActionClose(): string {
+    return this.coveringExecuteActionClose;
+  }
+
+  public getCoveringExecuteActionStop(): string {
+    return this.coveringExecuteActionStop;
+  }
+
+  public getCoveringTravelTimeSeconds(): number {
+    return this.coveringTravelTimeSeconds;
   }
 
   private normalizeCoveringControlMode(value?: string): 'set' | 'execute_action' | 'hybrid' {

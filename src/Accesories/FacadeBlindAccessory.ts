@@ -10,6 +10,11 @@ export class FacadeBlindAccessory {
   private currentTiltAngle = 0;
   private targetTiltAngle = 0;
   private connected = true;
+  private stopTimer?: NodeJS.Timeout;
+  private hasReceivedPosition = false;
+  private pendingTargetPosition?: number;
+  private pendingTargetExpiresAt = 0;
+  private pendingTargetTimer?: NodeJS.Timeout;
 
   constructor(
     private readonly platform: SuplaPlatform,
@@ -46,10 +51,24 @@ export class FacadeBlindAccessory {
         const value = parseFloat(message.toString());
         if (!Number.isNaN(value)) {
           this.currentPosition = this.toPosition(value);
-          if (Math.abs(this.targetPosition - this.currentPosition) <= 1) {
+          this.positionState = this.platform.Characteristic.PositionState.STOPPED;
+          const now = Date.now();
+          if (!this.hasReceivedPosition) {
+            this.hasReceivedPosition = true;
+            this.clearPendingTarget(false);
+            this.targetPosition = this.currentPosition;
+          } else if (this.pendingTargetPosition !== undefined) {
+            const reached = Math.abs(this.pendingTargetPosition - this.currentPosition) <= 1;
+            const expired = this.pendingTargetExpiresAt > 0 && now > this.pendingTargetExpiresAt;
+            if (reached || expired) {
+              this.clearPendingTarget(false);
+              this.targetPosition = this.currentPosition;
+            } else {
+              this.schedulePendingTimeout(this.pendingTargetPosition, this.currentPosition);
+            }
+          } else {
             this.targetPosition = this.currentPosition;
           }
-          this.positionState = this.platform.Characteristic.PositionState.STOPPED;
           this.service.updateCharacteristic(
             this.platform.Characteristic.CurrentPosition,
             this.currentPosition,
@@ -111,6 +130,12 @@ export class FacadeBlindAccessory {
     }
     this.service.updateCharacteristic(this.platform.Characteristic.TargetPosition, this.targetPosition);
     this.service.updateCharacteristic(this.platform.Characteristic.PositionState, this.positionState);
+    if (this.targetPosition !== this.currentPosition) {
+      this.pendingTargetPosition = this.targetPosition;
+      this.schedulePendingTimeout(this.targetPosition, this.currentPosition);
+    } else {
+      this.clearPendingTarget(false);
+    }
     const controlMode = this.platform.getCoveringControlMode();
     const shutValue = this.toShut(this.targetPosition).toString();
     if (controlMode === 'set' || controlMode === 'hybrid') {
@@ -123,20 +148,63 @@ export class FacadeBlindAccessory {
       });
     }
     if (controlMode === 'execute_action' || controlMode === 'hybrid') {
-      if (this.targetPosition === 0 || this.targetPosition === 100) {
-        const action = this.targetPosition === 0 ? 'close' : 'open';
-        const actionTopic = `${this.context.topic}/execute_action`;
+      const actionTopic = `${this.context.topic}/execute_action`;
+      if (controlMode === 'hybrid' && this.targetPosition !== 0 && this.targetPosition !== 100) {
+        return;
+      }
+      const action = this.resolveAction(this.targetPosition, this.currentPosition);
+      if (action) {
         this.platform.log.debug(`Publishing ${actionTopic} = ${action}`);
         this.platform.MqttClient.client.publish(actionTopic, action, (error) => {
           if (error) {
             this.platform.log.error(`Publish failed for ${actionTopic}: ${error.message}`);
           }
         });
-      } else if (controlMode === 'execute_action') {
-        this.platform.log.warn(
-          `Covering control mode execute_action does not support partial positions (${this.targetPosition}).`,
-        );
       }
+      if (controlMode === 'execute_action') {
+        this.scheduleStopIfNeeded(this.targetPosition, this.currentPosition);
+      }
+    }
+  }
+
+  private schedulePendingTimeout(target: number, current: number) {
+    const travelTimeSeconds = this.platform.getCoveringTravelTimeSeconds();
+    const delta = Math.abs(target - current);
+    let timeoutMs = 15000;
+    if (travelTimeSeconds > 0 && delta > 0) {
+      timeoutMs = Math.round((delta / 100) * travelTimeSeconds * 1000) + 1000;
+    }
+    if (timeoutMs <= 0) {
+      return;
+    }
+    this.pendingTargetExpiresAt = Date.now() + timeoutMs;
+    if (this.pendingTargetTimer) {
+      clearTimeout(this.pendingTargetTimer);
+    }
+    this.pendingTargetTimer = setTimeout(() => {
+      this.pendingTargetTimer = undefined;
+      this.pendingTargetPosition = undefined;
+      this.pendingTargetExpiresAt = 0;
+      if (this.positionState !== this.platform.Characteristic.PositionState.STOPPED) {
+        this.positionState = this.platform.Characteristic.PositionState.STOPPED;
+        this.service.updateCharacteristic(this.platform.Characteristic.PositionState, this.positionState);
+      }
+      this.platform.log.debug(
+        `No state updates for ${this.accessory.displayName} within ${timeoutMs}ms; marking STOPPED.`,
+      );
+    }, timeoutMs);
+  }
+
+  private clearPendingTarget(syncTarget: boolean) {
+    if (this.pendingTargetTimer) {
+      clearTimeout(this.pendingTargetTimer);
+      this.pendingTargetTimer = undefined;
+    }
+    this.pendingTargetPosition = undefined;
+    this.pendingTargetExpiresAt = 0;
+    if (syncTarget) {
+      this.targetPosition = this.currentPosition;
+      this.service.updateCharacteristic(this.platform.Characteristic.TargetPosition, this.targetPosition);
     }
   }
 
@@ -187,5 +255,42 @@ export class FacadeBlindAccessory {
 
   private clamp(value: number, min: number, max: number): number {
     return Math.min(Math.max(value, min), max);
+  }
+
+  private resolveAction(target: number, current: number): string | null {
+    if (target > current) {
+      return this.platform.getCoveringExecuteActionOpen();
+    }
+    if (target < current) {
+      return this.platform.getCoveringExecuteActionClose();
+    }
+    const stopAction = this.platform.getCoveringExecuteActionStop();
+    return stopAction ? stopAction : null;
+  }
+
+  private scheduleStopIfNeeded(target: number, current: number) {
+    const travelTimeSeconds = this.platform.getCoveringTravelTimeSeconds();
+    const stopAction = this.platform.getCoveringExecuteActionStop();
+    if (!travelTimeSeconds || !stopAction || target === current) {
+      if (this.stopTimer) {
+        clearTimeout(this.stopTimer);
+        this.stopTimer = undefined;
+      }
+      return;
+    }
+    const proportion = Math.abs(target - current) / 100;
+    const delayMs = Math.max(250, Math.round(proportion * travelTimeSeconds * 1000));
+    if (this.stopTimer) {
+      clearTimeout(this.stopTimer);
+    }
+    this.stopTimer = setTimeout(() => {
+      const actionTopic = `${this.context.topic}/execute_action`;
+      this.platform.log.debug(`Publishing ${actionTopic} = ${stopAction} (auto-stop)`);
+      this.platform.MqttClient.client.publish(actionTopic, stopAction, (error) => {
+        if (error) {
+          this.platform.log.error(`Publish failed for ${actionTopic}: ${error.message}`);
+        }
+      });
+    }, delayMs);
   }
 }

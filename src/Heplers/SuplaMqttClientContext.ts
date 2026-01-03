@@ -7,6 +7,7 @@ export class SuplaMqttClientContext {
     public protocol?: string,
     public tls?: boolean | string,
     public includeHidden?: boolean | string,
+    public mqttTopicScheme?: string,
   ) {
   }
 }

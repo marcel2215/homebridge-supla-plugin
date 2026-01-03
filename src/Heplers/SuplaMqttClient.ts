@@ -44,6 +44,23 @@ export class SuplaMqttClient {
   }
 
   public async discoverChannelsAsync() : Promise<Array<SuplaChannelContext>> {
+    const topicScheme = this.resolveTopicScheme();
+    this.log.debug(`MQTT topic scheme: ${topicScheme}`);
+    if (topicScheme === 'legacy') {
+      return this.discoverLegacyRollerShuttersAsync();
+    }
+    if (topicScheme === 'cloud') {
+      return this.discoverCloudChannelsAsync();
+    }
+    const cloudChannels = await this.discoverCloudChannelsAsync();
+    if (cloudChannels.length > 0) {
+      return cloudChannels;
+    }
+    this.log.warn('No channels discovered via cloud topics; trying legacy rollershutter topics.');
+    return this.discoverLegacyRollerShuttersAsync();
+  }
+
+  private async discoverCloudChannelsAsync(): Promise<Array<SuplaChannelContext>> {
     const subscriptionTopic = `supla/${this.context.username}/devices/+/channels/#`;
     const includeHidden = this.resolveIncludeHidden();
     const usernamePattern = this.escapeRegex(this.context.username);
@@ -164,6 +181,92 @@ export class SuplaMqttClient {
     return result;
   }
 
+  private async discoverLegacyRollerShuttersAsync(): Promise<Array<SuplaChannelContext>> {
+    const subscriptionTopic = 'supla/channels/status/rollershutter/#';
+    this.log.info('Discovering legacy rollershutter channels via MQTT');
+    this.log.debug(`Discovery subscribe topic: ${subscriptionTopic}`);
+    const channelMap = new Map<string, {
+      channelId: string;
+    }>();
+    let resolveDone: (() => void) | undefined;
+    const discoveryDone = new Promise<void>((resolve) => {
+      resolveDone = resolve;
+    });
+    let quietTimer: NodeJS.Timeout | undefined;
+    const maxWaitMs = 4000;
+    const quietWindowMs = 1000;
+    const maxTimer = setTimeout(() => resolveDone?.(), maxWaitMs);
+    const messageHandler = (topic: string, message: Buffer) => {
+      const match = topic.match(/^supla\/channels\/status\/rollershutter\/(\d+)$/);
+      if (!match) {
+        return;
+      }
+      const channelId = match[1];
+      if (!channelMap.has(channelId)) {
+        channelMap.set(channelId, {channelId});
+      }
+      try {
+        const payload = JSON.parse(message.toString());
+        if (payload && typeof payload.id !== 'undefined') {
+          const idValue = Number(payload.id);
+          if (!Number.isNaN(idValue)) {
+            const normalizedId = idValue.toString();
+            if (!channelMap.has(normalizedId)) {
+              channelMap.set(normalizedId, {channelId: normalizedId});
+            }
+          }
+        }
+      } catch {
+        // ignore non-JSON payloads
+      }
+      if (quietTimer) {
+        clearTimeout(quietTimer);
+      }
+      quietTimer = setTimeout(() => resolveDone?.(), quietWindowMs);
+    };
+
+    this.client.subscribe(subscriptionTopic, (err) => {
+      if (err) {
+        this.log.error(`MQTT subscribe failed for ${subscriptionTopic}: ${err.message}`);
+        resolveDone?.();
+      }
+    });
+    this.client.on('message', messageHandler);
+    await discoveryDone;
+    clearTimeout(maxTimer);
+    if (quietTimer) {
+      clearTimeout(quietTimer);
+    }
+    this.client.removeListener('message', messageHandler);
+    this.client.unsubscribe(subscriptionTopic, (err) => {
+      if (err) {
+        this.log.error(`MQTT unsubscribe failed for ${subscriptionTopic}: ${err.message}`);
+      }
+    });
+
+    const result: Array<SuplaChannelContext> = [];
+    for (const entry of channelMap.values()) {
+      const statusTopic = `supla/channels/status/rollershutter/${entry.channelId}`;
+      const caption = `RollerShutter ${entry.channelId}`;
+      const channelContext = new SuplaChannelContext(
+        statusTopic,
+        'RELAY',
+        'CONTROLLINGTHEROLLERSHUTTER',
+        caption,
+        'legacy',
+        entry.channelId,
+      );
+      result.push(channelContext);
+    }
+    if (channelMap.size === 0) {
+      this.log.warn(
+        `No legacy rollershutter channels discovered within ${maxWaitMs}ms.`,
+      );
+    }
+    this.log.info(`Legacy MQTT discovery complete. Channels discovered: ${result.length}`);
+    return result;
+  }
+
   private resolveProtocol(): string {
     const rawProtocol = (this.context.protocol ?? '').toString().toLowerCase();
     const tlsFlag = this.context.tls;
@@ -192,5 +295,16 @@ export class SuplaMqttClient {
 
   private escapeRegex(value: string): string {
     return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  }
+
+  private resolveTopicScheme(): 'cloud' | 'legacy' | 'auto' {
+    const raw = (this.context.mqttTopicScheme ?? '').toString().toLowerCase();
+    if (raw === 'legacy') {
+      return 'legacy';
+    }
+    if (raw === 'auto') {
+      return 'auto';
+    }
+    return 'cloud';
   }
 }
