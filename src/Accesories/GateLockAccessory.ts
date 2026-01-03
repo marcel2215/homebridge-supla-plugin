@@ -222,10 +222,14 @@ export class GateLockAccessory {
   private armTransitionTimer() {
     this.clearTransitionTimer();
     this.transitionTimer = setTimeout(() => {
+      const fallbackTarget = this.currentState === this.platform.Characteristic.LockCurrentState.UNSECURED
+        ? this.platform.Characteristic.LockTargetState.UNSECURED
+        : this.platform.Characteristic.LockTargetState.SECURED;
       this.transitionTimer = undefined;
       this.pendingTarget = undefined;
       this.hasFault = true;
       this.updateStatusFault();
+      this.setTargetState(fallbackTarget);
       this.setCurrentState(this.platform.Characteristic.LockCurrentState.UNKNOWN);
       this.platform.log.warn(
         `Gate lock ${this.accessory.displayName} did not reach target within ${this.transitionTimeoutMs}ms.`,

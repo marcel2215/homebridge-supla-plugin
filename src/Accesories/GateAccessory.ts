@@ -58,18 +58,22 @@ export class GateAccessory {
     this.platform.registerMqttHandler(
       `${this.context.topic}/state/hi`,
       (message) => {
-        this.isClosedSensorActive = this.platform.parseBoolean(message.toString());
+        const next = this.platform.parseBoolean(message.toString());
+        const changed = !this.hasClosedSensorState || next !== this.isClosedSensorActive;
+        this.isClosedSensorActive = next;
         this.hasClosedSensorState = true;
-        this.updateStatesFromSensors();
+        this.updateStatesFromSensors(changed);
       },
       this.accessory.UUID,
     );
     this.platform.registerMqttHandler(
       `${this.context.topic}/state/partial_hi`,
       (message) => {
-        this.isPartialSensorActive = this.platform.parseBoolean(message.toString());
+        const next = this.platform.parseBoolean(message.toString());
+        const changed = !this.hasPartialSensorState || next !== this.isPartialSensorActive;
+        this.isPartialSensorActive = next;
         this.hasPartialSensorState = true;
-        this.updateStatesFromSensors();
+        this.updateStatesFromSensors(changed);
       },
       this.accessory.UUID,
     );
@@ -150,10 +154,16 @@ export class GateAccessory {
     return this.obstructionDetected;
   }
 
-  private updateStatesFromSensors() {
+  private updateStatesFromSensors(changed: boolean) {
     this.clearFaults();
-    this.touchTransitionTimer();
+    if (changed) {
+      this.touchTransitionTimer();
+    }
     if (this.isClosedSensorActive) {
+      if (this.pendingTarget === this.platform.Characteristic.TargetDoorState.OPEN) {
+        this.setCurrentState(this.platform.Characteristic.CurrentDoorState.OPENING);
+        return;
+      }
       this.pendingTarget = undefined;
       this.clearTransitionTimer();
       this.applyDoorState(

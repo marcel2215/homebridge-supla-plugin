@@ -682,7 +682,16 @@ export class SuplaPlatform implements DynamicPlatformPlugin {
   }
 
   public publishCommand(topic: string, payload: string | Buffer, callback?: (error?: Error) => void) {
-    this.MqttClient.client.publish(
+    const client = this.MqttClient?.client;
+    if (!client || !client.connected) {
+      const error = new Error('MQTT not connected');
+      this.log.error(`MQTT not connected; cannot publish ${topic}`);
+      if (callback) {
+        callback(error);
+      }
+      return;
+    }
+    client.publish(
       topic,
       payload,
       { qos: this.commandQos, retain: this.commandRetain },
