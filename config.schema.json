@@ -33,6 +33,16 @@
       "type": "boolean",
       "default": false
     },
+    "mqttTopicScheme": {
+      "title": "MQTT Topic Scheme",
+      "type": "string",
+      "default": "cloud",
+      "enum": [
+        "cloud",
+        "legacy",
+        "auto"
+      ]
+    },
     "coveringControlMode": {
       "title": "Covering Control Mode",
       "type": "string",
@@ -46,12 +56,32 @@
     "coveringSetTopicSuffix": {
       "title": "Covering Set Topic Suffix",
       "type": "string",
-      "default": "set/shut"
+      "default": "set/closing_percentage"
     },
     "coveringTiltTopicSuffix": {
       "title": "Covering Tilt Topic Suffix",
       "type": "string",
       "default": "set/tilt"
+    },
+    "coveringExecuteActionOpen": {
+      "title": "Covering Execute Action Open",
+      "type": "string",
+      "default": "reveal"
+    },
+    "coveringExecuteActionClose": {
+      "title": "Covering Execute Action Close",
+      "type": "string",
+      "default": "shut"
+    },
+    "coveringExecuteActionStop": {
+      "title": "Covering Execute Action Stop",
+      "type": "string",
+      "default": "stop"
+    },
+    "coveringTravelTimeSeconds": {
+      "title": "Covering Travel Time Seconds",
+      "type": "number",
+      "default": 0
     },
     "username": {
       "title": "Username",
