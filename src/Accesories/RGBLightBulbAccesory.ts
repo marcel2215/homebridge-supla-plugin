@@ -41,35 +41,38 @@ export class RGBLightAccesory {
       .onGet(this.handleSaturationGet.bind(this))
       .onSet(this.handleSaturationSet.bind(this));
 
-    this.platform.MqttClient.client.subscribe(`${this.context.topic}/state/on`);
-    this.platform.MqttClient.client.subscribe(`${this.context.topic}/state/color`);
-    this.platform.MqttClient.client.subscribe(`${this.context.topic}/state/color_brightness`);
-    this.platform.MqttClient.client.subscribe(`${this.context.topic}/state/connected`);
-
-    this.platform.MqttClient.client.on('message', (topic, message) => {
-      switch (topic) {
-        case `${this.context.topic}/state/on`:
-          this.state = message.toString() === 'true';
-          this.service.updateCharacteristic(this.platform.Characteristic.On, this.state);
-          break;
-        case `${this.context.topic}/state/color`:
-          this.rgb = HexToRGB(message.toString());
-          this.hsv = RGBtoHSV(this.rgb.r, this.rgb.g, this.rgb.b);
-          this.updateColor();
-          break;
-        case `${this.context.topic}/state/color_brightness`:
-          this.hsv.v = parseInt(message.toString(), 10);
-          this.updateColor();
-          break;
-        case `${this.context.topic}/state/connected`:
-          this.connected = message.toString() === 'true';
-          this.service.updateCharacteristic(
-            this.platform.Characteristic.StatusFault,
-            this.connected ? 0 : 1,
-          );
-          break;
-      }
-    });
+    this.platform.registerMqttHandler(
+      `${this.context.topic}/state/on`,
+      (message) => {
+        this.state = this.platform.parseBoolean(message.toString());
+        this.service.updateCharacteristic(this.platform.Characteristic.On, this.state);
+      },
+    );
+    this.platform.registerMqttHandler(
+      `${this.context.topic}/state/color`,
+      (message) => {
+        this.rgb = HexToRGB(message.toString());
+        this.hsv = RGBtoHSV(this.rgb.r, this.rgb.g, this.rgb.b);
+        this.updateColor();
+      },
+    );
+    this.platform.registerMqttHandler(
+      `${this.context.topic}/state/color_brightness`,
+      (message) => {
+        this.hsv.v = parseInt(message.toString(), 10);
+        this.updateColor();
+      },
+    );
+    this.platform.registerMqttHandler(
+      `${this.context.topic}/state/connected`,
+      (message) => {
+        this.connected = this.platform.parseBoolean(message.toString());
+        this.service.updateCharacteristic(
+          this.platform.Characteristic.StatusFault,
+          this.connected ? 0 : 1,
+        );
+      },
+    );
   }
 
   async handleOnGet(): Promise<CharacteristicValue> {

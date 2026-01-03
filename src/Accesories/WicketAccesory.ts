@@ -31,16 +31,16 @@ export class WicketAccesory {
         this.service.getCharacteristic(this.platform.Characteristic.ObstructionDetected)
           .onGet(this.handleObstructionDetectedGet.bind(this));
 
-        this.platform.MqttClient.client.subscribe(`${this.context.topic}/state/connected`);
-        this.platform.MqttClient.client.on('message', (topic, message) => {
-          if (topic === `${this.context.topic}/state/connected`) {
-            this.connected = message.toString() === 'true';
+        this.platform.registerMqttHandler(
+          `${this.context.topic}/state/connected`,
+          (message) => {
+            this.connected = this.platform.parseBoolean(message.toString());
             this.service.updateCharacteristic(
               this.platform.Characteristic.StatusFault,
               this.connected ? 0 : 1,
             );
-          }
-        });
+          },
+        );
   }
 
   async handleCurrentDoorStateGet(): Promise<CharacteristicValue> {

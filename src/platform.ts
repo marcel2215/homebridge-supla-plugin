@@ -44,6 +44,9 @@ export class SuplaPlatform implements DynamicPlatformPlugin {
   private readonly coveringExecuteActionClose: string;
   private readonly coveringExecuteActionStop: string;
   private readonly coveringTravelTimeSeconds: number;
+  private readonly mqttHandlers = new Map<string, Set<(message: Buffer, topic: string) => void>>();
+  private readonly mqttSubscriptions = new Set<string>();
+  private mqttRouterAttached = false;
 
   constructor(
     public readonly log: Logger,
@@ -72,6 +75,7 @@ export class SuplaPlatform implements DynamicPlatformPlugin {
       log.debug('Executed didFinishLaunching callback');
       const mqttSettings = this.config as unknown as SuplaMqttClientContext;
       this.MqttClient = new SuplaMqttClient(mqttSettings, this.log);
+      this.startMqttRouter();
       this.discoverDevices();
       this.MqttClient.discoverChannelsAsync().then((channels) => {
         this.persistChannels(channels);
@@ -391,5 +395,80 @@ export class SuplaPlatform implements DynamicPlatformPlugin {
 
   private normalizeTopicSuffix(value: string): string {
     return value.toString().replace(/^\/+/, '');
+  }
+
+  public registerMqttHandler(topic: string, handler: (message: Buffer, topic: string) => void): () => void {
+    if (!topic) {
+      return () => undefined;
+    }
+    this.startMqttRouter();
+    const handlers = this.mqttHandlers.get(topic) ?? new Set();
+    handlers.add(handler);
+    this.mqttHandlers.set(topic, handlers);
+    if (!this.mqttSubscriptions.has(topic)) {
+      this.MqttClient.client.subscribe(topic, (err) => {
+        if (err) {
+          this.log.error(`MQTT subscribe failed for ${topic}: ${err.message}`);
+        }
+      });
+      this.mqttSubscriptions.add(topic);
+    }
+    return () => {
+      const active = this.mqttHandlers.get(topic);
+      if (!active) {
+        return;
+      }
+      active.delete(handler);
+      if (active.size === 0) {
+        this.mqttHandlers.delete(topic);
+        if (this.mqttSubscriptions.has(topic)) {
+          this.MqttClient.client.unsubscribe(topic, (err) => {
+            if (err) {
+              this.log.error(`MQTT unsubscribe failed for ${topic}: ${err.message}`);
+            }
+          });
+          this.mqttSubscriptions.delete(topic);
+        }
+      }
+    };
+  }
+
+  public parseBoolean(value: unknown): boolean {
+    if (typeof value === 'boolean') {
+      return value;
+    }
+    if (typeof value === 'number') {
+      return value === 1;
+    }
+    if (typeof value === 'string') {
+      const normalized = value.trim().toLowerCase();
+      return normalized === '1'
+        || normalized === 'true'
+        || normalized === 'on'
+        || normalized === 'yes';
+    }
+    return false;
+  }
+
+  private startMqttRouter() {
+    if (this.mqttRouterAttached || !this.MqttClient) {
+      return;
+    }
+    this.mqttRouterAttached = true;
+    this.MqttClient.client.on('message', (topic, message) => {
+      const handlers = this.mqttHandlers.get(topic);
+      if (!handlers) {
+        return;
+      }
+      for (const handler of handlers) {
+        try {
+          handler(message, topic);
+        } catch (error) {
+          this.log.error(
+            `MQTT handler error for ${topic}: ${(error as Error).message}`,
+          );
+        }
+      }
+    });
   }
 }

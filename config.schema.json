@@ -28,6 +28,21 @@
       "type": "boolean",
       "default": true
     },
+    "tlsCaPath": {
+      "title": "TLS CA Path",
+      "type": "string",
+      "default": ""
+    },
+    "tlsRejectUnauthorized": {
+      "title": "TLS Reject Unauthorized",
+      "type": "boolean",
+      "default": true
+    },
+    "tlsServername": {
+      "title": "TLS Servername (SNI)",
+      "type": "string",
+      "default": ""
+    },
     "includeHidden": {
       "title": "Include Hidden Channels",
       "type": "boolean",

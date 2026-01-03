@@ -38,26 +38,30 @@ export class DoorAccessory {
     this.service.getCharacteristic(this.platform.Characteristic.PositionState)
       .onGet(this.handlePositionStateGet.bind(this));
 
-    this.platform.MqttClient.client.subscribe(`${this.context.topic}/state/hi`);
-    this.platform.MqttClient.client.subscribe(`${this.context.topic}/state/partial_hi`);
-    this.platform.MqttClient.client.subscribe(`${this.context.topic}/state/connected`);
-    this.platform.MqttClient.client.on('message', (topic, message) => {
-      if (topic === `${this.context.topic}/state/hi`) {
-        this.hi = message.toString() === 'true';
+    this.platform.registerMqttHandler(
+      `${this.context.topic}/state/hi`,
+      (message) => {
+        this.hi = this.platform.parseBoolean(message.toString());
         this.updatePositionsFromState();
-      }
-      if (topic === `${this.context.topic}/state/partial_hi`) {
-        this.partialHi = message.toString() === 'true';
+      },
+    );
+    this.platform.registerMqttHandler(
+      `${this.context.topic}/state/partial_hi`,
+      (message) => {
+        this.partialHi = this.platform.parseBoolean(message.toString());
         this.updatePositionsFromState();
-      }
-      if (topic === `${this.context.topic}/state/connected`) {
-        this.connected = message.toString() === 'true';
+      },
+    );
+    this.platform.registerMqttHandler(
+      `${this.context.topic}/state/connected`,
+      (message) => {
+        this.connected = this.platform.parseBoolean(message.toString());
         this.service.updateCharacteristic(
           this.platform.Characteristic.StatusFault,
           this.connected ? 0 : 1,
         );
-      }
-    });
+      },
+    );
   }
 
   async handleCurrentPositionGet(): Promise<CharacteristicValue> {

@@ -43,11 +43,9 @@ export class FacadeBlindAccessory {
       .onGet(this.handleTargetTiltGet.bind(this))
       .onSet(this.handleTargetTiltSet.bind(this));
 
-    this.platform.MqttClient.client.subscribe(`${this.context.topic}/state/shut`);
-    this.platform.MqttClient.client.subscribe(`${this.context.topic}/state/tilt`);
-    this.platform.MqttClient.client.subscribe(`${this.context.topic}/state/connected`);
-    this.platform.MqttClient.client.on('message', (topic, message) => {
-      if (topic === `${this.context.topic}/state/shut`) {
+    this.platform.registerMqttHandler(
+      `${this.context.topic}/state/shut`,
+      (message) => {
         const value = parseFloat(message.toString());
         if (!Number.isNaN(value)) {
           this.currentPosition = this.toPosition(value);
@@ -82,8 +80,11 @@ export class FacadeBlindAccessory {
             this.positionState,
           );
         }
-      }
-      if (topic === `${this.context.topic}/state/tilt`) {
+      },
+    );
+    this.platform.registerMqttHandler(
+      `${this.context.topic}/state/tilt`,
+      (message) => {
         const value = parseFloat(message.toString());
         if (!Number.isNaN(value)) {
           this.currentTiltAngle = this.toTiltAngle(value);
@@ -99,15 +100,18 @@ export class FacadeBlindAccessory {
             this.targetTiltAngle,
           );
         }
-      }
-      if (topic === `${this.context.topic}/state/connected`) {
-        this.connected = message.toString() === 'true';
+      },
+    );
+    this.platform.registerMqttHandler(
+      `${this.context.topic}/state/connected`,
+      (message) => {
+        this.connected = this.platform.parseBoolean(message.toString());
         this.service.updateCharacteristic(
           this.platform.Characteristic.StatusFault,
           this.connected ? 0 : 1,
         );
-      }
-    });
+      },
+    );
   }
 
   async handleCurrentPositionGet(): Promise<CharacteristicValue> {

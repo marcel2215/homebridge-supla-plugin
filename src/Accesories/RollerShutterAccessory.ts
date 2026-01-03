@@ -45,12 +45,9 @@ export class RollerShutterAccessory {
       ? undefined
       : `${this.context.topic}/state/connected`;
 
-    this.platform.MqttClient.client.subscribe(statusTopic);
-    if (connectedTopic) {
-      this.platform.MqttClient.client.subscribe(connectedTopic);
-    }
-    this.platform.MqttClient.client.on('message', (topic, message) => {
-      if (topic === statusTopic) {
+    this.platform.registerMqttHandler(
+      statusTopic,
+      (message) => {
         if (this.legacyMode) {
           const parsed = this.parseLegacyPayload(message.toString());
           if (parsed?.shut !== undefined) {
@@ -59,17 +56,22 @@ export class RollerShutterAccessory {
           if (parsed?.online !== undefined) {
             this.updateConnection(parsed.online);
           }
-        } else {
-          const value = parseFloat(message.toString());
-          if (!Number.isNaN(value)) {
-            this.applyShutUpdate(value);
-          }
+          return;
         }
-      }
-      if (!this.legacyMode && connectedTopic && topic === connectedTopic) {
-        this.updateConnection(message.toString() === 'true');
-      }
-    });
+        const value = parseFloat(message.toString());
+        if (!Number.isNaN(value)) {
+          this.applyShutUpdate(value);
+        }
+      },
+    );
+    if (connectedTopic) {
+      this.platform.registerMqttHandler(
+        connectedTopic,
+        (message) => {
+          this.updateConnection(this.platform.parseBoolean(message.toString()));
+        },
+      );
+    }
   }
 
   async handleCurrentPositionGet(): Promise<CharacteristicValue> {
@@ -192,10 +194,7 @@ export class RollerShutterAccessory {
       result.shut = shutValue;
     }
     if (typeof record.online !== 'undefined') {
-      result.online = record.online === true
-        || record.online === 1
-        || record.online === '1'
-        || record.online === 'true';
+      result.online = this.platform.parseBoolean(record.online);
     }
     return result;
   }

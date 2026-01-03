@@ -1,4 +1,5 @@
 import mqtt, {MqttClient} from 'mqtt';
+import * as fs from 'fs';
 import {Logger} from 'homebridge';
 import {SuplaMqttClientContext} from './SuplaMqttClientContext';
 import {SuplaChannelContext} from './SuplaChannelContext';
@@ -8,11 +9,14 @@ export class SuplaMqttClient {
   constructor(
     private readonly context : SuplaMqttClientContext,
     private readonly log : Logger) {
-    const options = {
+    const options: mqtt.IClientOptions = {
       username: context.username,
       password: context.password,
     };
     const protocol = this.resolveProtocol();
+    if (this.usesTls(protocol)) {
+      Object.assign(options, this.resolveTlsOptions());
+    }
     this.log.info(
       `MQTT connecting to ${protocol}://${context.host}:${context.port} as ${context.username}`,
     );
@@ -20,8 +24,6 @@ export class SuplaMqttClient {
       this.log.warn('MQTT config looks incomplete; check host/port/username.');
     }
     this.client = mqtt.connect(`${protocol}://${context.host}:${context.port}`, options);
-
-    this.client.setMaxListeners(0);
 
     this.client.on('connect', () => {
       this.log.info('MQTT client connected');
@@ -269,10 +271,7 @@ export class SuplaMqttClient {
 
   private resolveProtocol(): string {
     const rawProtocol = (this.context.protocol ?? '').toString().toLowerCase();
-    const tlsFlag = this.context.tls;
-    const tlsEnabled = typeof tlsFlag === 'string'
-      ? ['1', 'true', 'on', 'yes'].includes(tlsFlag.toLowerCase())
-      : Boolean(tlsFlag);
+    const tlsEnabled = this.resolveBoolean(this.context.tls, false);
     if (!rawProtocol) {
       return tlsEnabled ? 'mqtts' : 'mqtt';
     }
@@ -286,15 +285,57 @@ export class SuplaMqttClient {
   }
 
   private resolveIncludeHidden(): boolean {
-    const raw = this.context.includeHidden;
-    if (typeof raw === 'string') {
-      return ['1', 'true', 'on', 'yes'].includes(raw.toLowerCase());
-    }
-    return Boolean(raw);
+    return this.resolveBoolean(this.context.includeHidden, false);
   }
 
   private escapeRegex(value: string): string {
     return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  }
+
+  private usesTls(protocol: string): boolean {
+    return protocol === 'mqtts' || protocol === 'wss';
+  }
+
+  private resolveTlsOptions(): mqtt.IClientOptions {
+    const options: mqtt.IClientOptions = {};
+    const caPath = (this.context.tlsCaPath ?? '').toString().trim();
+    if (caPath) {
+      try {
+        options.ca = fs.readFileSync(caPath);
+      } catch (error) {
+        this.log.error(`Failed to read TLS CA at ${caPath}: ${(error as Error).message}`);
+      }
+    }
+    const servername = (this.context.tlsServername ?? '').toString().trim();
+    if (servername) {
+      options.servername = servername;
+    }
+    if (typeof this.context.tlsRejectUnauthorized !== 'undefined') {
+      options.rejectUnauthorized = this.resolveBoolean(this.context.tlsRejectUnauthorized, true);
+    }
+    return options;
+  }
+
+  private resolveBoolean(value: unknown, fallback: boolean): boolean {
+    if (typeof value === 'boolean') {
+      return value;
+    }
+    if (typeof value === 'number') {
+      return value === 1;
+    }
+    if (typeof value === 'string') {
+      const normalized = value.trim().toLowerCase();
+      if (normalized === '') {
+        return fallback;
+      }
+      if (['1', 'true', 'on', 'yes'].includes(normalized)) {
+        return true;
+      }
+      if (['0', 'false', 'off', 'no'].includes(normalized)) {
+        return false;
+      }
+    }
+    return fallback;
   }
 
   private resolveTopicScheme(): 'cloud' | 'legacy' | 'auto' {

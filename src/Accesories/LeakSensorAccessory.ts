@@ -24,24 +24,26 @@ export class LeakSensorAccessory {
     this.service.getCharacteristic(this.platform.Characteristic.LeakDetected)
       .onGet(this.handleStateGet.bind(this));
 
-    this.platform.MqttClient.client.subscribe(`${this.context.topic}/state/hi`);
-    this.platform.MqttClient.client.subscribe(`${this.context.topic}/state/connected`);
-    this.platform.MqttClient.client.on('message', (topic, message) => {
-      if (topic === `${this.context.topic}/state/hi`) {
-        const leak = message.toString() === 'true';
+    this.platform.registerMqttHandler(
+      `${this.context.topic}/state/hi`,
+      (message) => {
+        const leak = this.platform.parseBoolean(message.toString());
         this.state = leak
           ? this.platform.Characteristic.LeakDetected.LEAK_DETECTED
           : this.platform.Characteristic.LeakDetected.LEAK_NOT_DETECTED;
         this.service.updateCharacteristic(this.platform.Characteristic.LeakDetected, this.state);
-      }
-      if (topic === `${this.context.topic}/state/connected`) {
-        this.connected = message.toString() === 'true';
+      },
+    );
+    this.platform.registerMqttHandler(
+      `${this.context.topic}/state/connected`,
+      (message) => {
+        this.connected = this.platform.parseBoolean(message.toString());
         this.service.updateCharacteristic(
           this.platform.Characteristic.StatusFault,
           this.connected ? 0 : 1,
         );
-      }
-    });
+      },
+    );
   }
 
   async handleStateGet(): Promise<CharacteristicValue> {

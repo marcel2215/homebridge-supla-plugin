@@ -30,11 +30,9 @@ export class TemperatureHumidityAccessory {
     this.humidityService.getCharacteristic(this.platform.Characteristic.CurrentRelativeHumidity)
       .onGet(this.handleHumidityGet.bind(this));
 
-    this.platform.MqttClient.client.subscribe(`${this.context.topic}/state/temperature`);
-    this.platform.MqttClient.client.subscribe(`${this.context.topic}/state/humidity`);
-    this.platform.MqttClient.client.subscribe(`${this.context.topic}/state/connected`);
-    this.platform.MqttClient.client.on('message', (topic, message) => {
-      if (topic === `${this.context.topic}/state/temperature`) {
+    this.platform.registerMqttHandler(
+      `${this.context.topic}/state/temperature`,
+      (message) => {
         const value = parseFloat(message.toString());
         if (!Number.isNaN(value)) {
           this.temperature = this.clamp(value, -50, 100);
@@ -43,8 +41,11 @@ export class TemperatureHumidityAccessory {
             this.temperature,
           );
         }
-      }
-      if (topic === `${this.context.topic}/state/humidity`) {
+      },
+    );
+    this.platform.registerMqttHandler(
+      `${this.context.topic}/state/humidity`,
+      (message) => {
         const value = parseFloat(message.toString());
         if (!Number.isNaN(value)) {
           this.humidity = this.clamp(value, 0, 100);
@@ -53,9 +54,12 @@ export class TemperatureHumidityAccessory {
             this.humidity,
           );
         }
-      }
-      if (topic === `${this.context.topic}/state/connected`) {
-        this.connected = message.toString() === 'true';
+      },
+    );
+    this.platform.registerMqttHandler(
+      `${this.context.topic}/state/connected`,
+      (message) => {
+        this.connected = this.platform.parseBoolean(message.toString());
         const faultValue = this.connected ? 0 : 1;
         this.temperatureService.updateCharacteristic(
           this.platform.Characteristic.StatusFault,
@@ -65,8 +69,8 @@ export class TemperatureHumidityAccessory {
           this.platform.Characteristic.StatusFault,
           faultValue,
         );
-      }
-    });
+      },
+    );
   }
 
   async handleTemperatureGet(): Promise<CharacteristicValue> {

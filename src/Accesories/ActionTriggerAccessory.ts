@@ -20,25 +20,26 @@ export class ActionTriggerAccessory {
 
     this.service.setCharacteristic(this.platform.Characteristic.Name, accessory.displayName);
 
-    this.platform.MqttClient.client.subscribe(`${this.context.topic}/state/action`);
-    this.platform.MqttClient.client.subscribe(`${this.context.topic}/state/connected`);
-    this.platform.MqttClient.client.on('message', (topic, message) => {
-      if (topic !== `${this.context.topic}/state/action`) {
-        if (topic === `${this.context.topic}/state/connected`) {
-          this.connected = message.toString() === 'true';
-          this.service.updateCharacteristic(
-            this.platform.Characteristic.StatusFault,
-            this.connected ? 0 : 1,
-          );
-        }
-        return;
-      }
-      const event = this.parseEvent(message.toString());
-      this.platform.log.debug(
-        `Action trigger ${this.context.channelCaption} event=${event}`,
-      );
-      this.service.updateCharacteristic(this.platform.Characteristic.ProgrammableSwitchEvent, event);
-    });
+    this.platform.registerMqttHandler(
+      `${this.context.topic}/state/action`,
+      (message) => {
+        const event = this.parseEvent(message.toString());
+        this.platform.log.debug(
+          `Action trigger ${this.context.channelCaption} event=${event}`,
+        );
+        this.service.updateCharacteristic(this.platform.Characteristic.ProgrammableSwitchEvent, event);
+      },
+    );
+    this.platform.registerMqttHandler(
+      `${this.context.topic}/state/connected`,
+      (message) => {
+        this.connected = this.platform.parseBoolean(message.toString());
+        this.service.updateCharacteristic(
+          this.platform.Characteristic.StatusFault,
+          this.connected ? 0 : 1,
+        );
+      },
+    );
   }
 
   private parseEvent(payload: string): number {

@@ -32,23 +32,26 @@ export class GarageDoorOpenerAccesory {
         this.service.getCharacteristic(this.platform.Characteristic.ObstructionDetected)
           .onGet(this.handleObstructionDetectedGet.bind(this));
 
-        this.platform.MqttClient.client.subscribe(`${this.context.topic}/state/hi`);
-        this.platform.MqttClient.client.subscribe(`${this.context.topic}/state/connected`);
-        this.platform.MqttClient.client.on('message', (topic, message) => {
-          if (topic === `${this.context.topic}/state/hi`) {
+        this.platform.registerMqttHandler(
+          `${this.context.topic}/state/hi`,
+          (message) => {
             this.platform.log.info(`Door ${this.context.channelCaption} state changed to ${message.toString()}`);
-            this.state = message.toString() === 'true'
-              ? this.platform.Characteristic.CurrentDoorState.CLOSED : this.platform.Characteristic.CurrentDoorState.OPEN;
+            this.state = this.platform.parseBoolean(message.toString())
+              ? this.platform.Characteristic.CurrentDoorState.CLOSED
+              : this.platform.Characteristic.CurrentDoorState.OPEN;
             this.service.updateCharacteristic(this.platform.Characteristic.CurrentDoorState, this.state);
-          }
-          if (topic === `${this.context.topic}/state/connected`) {
-            this.connected = message.toString() === 'true';
+          },
+        );
+        this.platform.registerMqttHandler(
+          `${this.context.topic}/state/connected`,
+          (message) => {
+            this.connected = this.platform.parseBoolean(message.toString());
             this.service.updateCharacteristic(
               this.platform.Characteristic.StatusFault,
               this.connected ? 0 : 1,
             );
-          }
-        });
+          },
+        );
   }
 
   async handleCurrentDoorStateGet(): Promise<CharacteristicValue> {

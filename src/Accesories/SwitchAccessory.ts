@@ -26,23 +26,27 @@ export class SwitchAccessory {
       .onGet(this.handleOnGet.bind(this))
       .onSet(this.handleOnSet.bind(this));
 
-    this.platform.MqttClient.client.subscribe(`${this.context.topic}/state/on`);
-    this.platform.MqttClient.client.subscribe(`${this.context.topic}/state/connected`);
-    this.platform.MqttClient.client.subscribe(`${this.context.topic}/state/overcurrent_relay_off`);
-    this.platform.MqttClient.client.on('message', (topic, message) => {
-      if (topic === `${this.context.topic}/state/on`) {
-        this.state = message.toString() === 'true';
+    this.platform.registerMqttHandler(
+      `${this.context.topic}/state/on`,
+      (message) => {
+        this.state = this.platform.parseBoolean(message.toString());
         this.service.updateCharacteristic(this.platform.Characteristic.On, this.state);
-      }
-      if (topic === `${this.context.topic}/state/connected`) {
-        this.connected = message.toString() === 'true';
+      },
+    );
+    this.platform.registerMqttHandler(
+      `${this.context.topic}/state/connected`,
+      (message) => {
+        this.connected = this.platform.parseBoolean(message.toString());
         this.updateFault();
-      }
-      if (topic === `${this.context.topic}/state/overcurrent_relay_off`) {
-        this.overcurrent = message.toString() === 'true';
+      },
+    );
+    this.platform.registerMqttHandler(
+      `${this.context.topic}/state/overcurrent_relay_off`,
+      (message) => {
+        this.overcurrent = this.platform.parseBoolean(message.toString());
         this.updateFault();
-      }
-    });
+      },
+    );
   }
 
   async handleOnGet(): Promise<CharacteristicValue> {

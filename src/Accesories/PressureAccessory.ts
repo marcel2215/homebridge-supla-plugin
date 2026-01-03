@@ -24,10 +24,9 @@ export class PressureAccessory {
     this.service.getCharacteristic(this.platform.Characteristic.CurrentAmbientLightLevel)
       .onGet(this.handleValueGet.bind(this));
 
-    this.platform.MqttClient.client.subscribe(`${this.context.topic}/state/value`);
-    this.platform.MqttClient.client.subscribe(`${this.context.topic}/state/connected`);
-    this.platform.MqttClient.client.on('message', (topic, message) => {
-      if (topic === `${this.context.topic}/state/value`) {
+    this.platform.registerMqttHandler(
+      `${this.context.topic}/state/value`,
+      (message) => {
         const value = parseFloat(message.toString());
         if (!Number.isNaN(value)) {
           this.value = this.clamp(value, 0.0001, 100000);
@@ -36,15 +35,18 @@ export class PressureAccessory {
             this.value,
           );
         }
-      }
-      if (topic === `${this.context.topic}/state/connected`) {
-        this.connected = message.toString() === 'true';
+      },
+    );
+    this.platform.registerMqttHandler(
+      `${this.context.topic}/state/connected`,
+      (message) => {
+        this.connected = this.platform.parseBoolean(message.toString());
         this.service.updateCharacteristic(
           this.platform.Characteristic.StatusFault,
           this.connected ? 0 : 1,
         );
-      }
-    });
+      },
+    );
   }
 
   async handleValueGet(): Promise<CharacteristicValue> {

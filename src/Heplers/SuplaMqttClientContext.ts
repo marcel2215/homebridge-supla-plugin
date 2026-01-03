@@ -6,6 +6,9 @@ export class SuplaMqttClientContext {
     public password: string,
     public protocol?: string,
     public tls?: boolean | string,
+    public tlsCaPath?: string,
+    public tlsRejectUnauthorized?: boolean | string,
+    public tlsServername?: string,
     public includeHidden?: boolean | string,
     public mqttTopicScheme?: string,
   ) {

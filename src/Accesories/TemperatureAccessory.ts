@@ -24,10 +24,9 @@ export class TemperatureAccessory {
     this.service.getCharacteristic(this.platform.Characteristic.CurrentTemperature)
       .onGet(this.handleTemperatureGet.bind(this));
 
-    this.platform.MqttClient.client.subscribe(`${this.context.topic}/state/temperature`);
-    this.platform.MqttClient.client.subscribe(`${this.context.topic}/state/connected`);
-    this.platform.MqttClient.client.on('message', (topic, message) => {
-      if (topic === `${this.context.topic}/state/temperature`) {
+    this.platform.registerMqttHandler(
+      `${this.context.topic}/state/temperature`,
+      (message) => {
         const value = parseFloat(message.toString());
         if (!Number.isNaN(value)) {
           this.temperature = this.clamp(value, -50, 100);
@@ -36,15 +35,18 @@ export class TemperatureAccessory {
             this.temperature,
           );
         }
-      }
-      if (topic === `${this.context.topic}/state/connected`) {
-        this.connected = message.toString() === 'true';
+      },
+    );
+    this.platform.registerMqttHandler(
+      `${this.context.topic}/state/connected`,
+      (message) => {
+        this.connected = this.platform.parseBoolean(message.toString());
         this.service.updateCharacteristic(
           this.platform.Characteristic.StatusFault,
           this.connected ? 0 : 1,
         );
-      }
-    });
+      },
+    );
   }
 
   async handleTemperatureGet(): Promise<CharacteristicValue> {
