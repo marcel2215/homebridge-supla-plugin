@@ -8,6 +8,7 @@ export class LightAccesory {
   private state = false;
   private connected = true;
   private overcurrent = false;
+  private updateTimer?: NodeJS.Timeout;
 
   constructor(
         private readonly platform: SuplaPlatform,
@@ -26,6 +27,10 @@ export class LightAccesory {
         this.service.getCharacteristic(this.platform.Characteristic.On)
           .onGet(this.handleOnGet.bind(this))
           .onSet(this.handleOnSet.bind(this));
+
+        this.platform.registerOwnerCleanup(this.accessory.UUID, () => {
+          this.clearUpdateTimer();
+        });
 
         this.platform.registerMqttHandler(
           `${this.context.topic}/state/on`,
@@ -65,7 +70,8 @@ export class LightAccesory {
     this.platform.publishCommand(
       `${this.context.topic}/set/on`,
       value.toString());
-    setTimeout(() => {
+    this.clearUpdateTimer();
+    this.updateTimer = setTimeout(() => {
       this.service.updateCharacteristic(this.platform.Characteristic.On, this.state);
     }, 300);
   }
@@ -73,5 +79,12 @@ export class LightAccesory {
   private updateFault() {
     const fault = this.connected && !this.overcurrent ? 0 : 1;
     this.service.updateCharacteristic(this.platform.Characteristic.StatusFault, fault);
+  }
+
+  private clearUpdateTimer() {
+    if (this.updateTimer) {
+      clearTimeout(this.updateTimer);
+      this.updateTimer = undefined;
+    }
   }
 }

@@ -59,7 +59,20 @@ export class SuplaPlatform implements DynamicPlatformPlugin {
   private readonly commandRetain: boolean;
   private readonly mqttHandlers = new Map<string, Set<(message: Buffer, topic: string) => void>>();
   private readonly mqttHandlerOwners = new Map<string, Map<string, Set<(message: Buffer, topic: string) => void>>>();
+  private readonly mqttWildcardHandlers = new Map<string, Set<(message: Buffer, topic: string) => void>>();
+  private readonly ownerCleanups = new Map<string, Set<() => void>>();
+  private readonly mqttDesiredSubscriptions = new Set<string>();
   private readonly mqttSubscriptions = new Set<string>();
+  private readonly mqttPendingSubscriptions = new Set<string>();
+  private readonly mqttRetryTimers = new Map<string, NodeJS.Timeout>();
+  private readonly mqttRetryState = new Map<string, {
+    attempt: number;
+    delayMs: number;
+    lastLogAt: number;
+    hardDenyCount: number;
+    blockedUntil: number;
+  }>();
+
   private mqttRouterAttached = false;
 
   constructor(
@@ -109,13 +122,37 @@ export class SuplaPlatform implements DynamicPlatformPlugin {
     this.commandQos = this.normalizeCommandQos(configView.commandQos);
     this.commandRetain = this.parseBoolean(configView.commandRetain ?? false);
 
+    this.api.on('shutdown', () => {
+      this.unregisterAllMqttHandlers();
+      if (this.MqttClient) {
+        this.MqttClient.client.end(true);
+      }
+    });
+
     this.api.on('didFinishLaunching', () => {
       log.debug('Executed didFinishLaunching callback');
       const mqttSettings = this.config as unknown as SuplaMqttClientContext;
       this.MqttClient = new SuplaMqttClient(mqttSettings, this.log);
       this.startMqttRouter();
+      this.MqttClient.client.on('connect', () => {
+        this.resubscribeAll(true);
+      });
+      this.MqttClient.client.on('close', () => {
+        this.clearActiveSubscriptions();
+      });
+      this.MqttClient.client.on('offline', () => {
+        this.clearActiveSubscriptions();
+      });
+      this.MqttClient.client.on('end', () => {
+        this.clearActiveSubscriptions();
+      });
+      if (this.MqttClient.client.connected) {
+        this.resubscribeAll(true);
+      }
       this.discoverDevices();
-      this.MqttClient.discoverChannelsAsync().then((channels) => {
+      this.MqttClient.discoverChannelsAsync((topic, handler) => (
+        this.registerMqttHandler(topic, handler, 'discovery')
+      )).then((channels) => {
         this.persistChannels(channels);
         this.discoverDevices(channels);
         this.log.info('Channels discovered and saved to config file');
@@ -158,12 +195,23 @@ export class SuplaPlatform implements DynamicPlatformPlugin {
 
       if (existingAccessory) {
         this.log.info('Restoring existing accessory from cache:', existingAccessory.displayName);
+        const signature = this.getChannelSignature(channel);
+        const previousSignature = existingAccessory.context.deviceSignature;
+        const wasConfigured = existingAccessory.context.deviceConfigured === true;
         existingAccessory.context.device = channel;
+        existingAccessory.context.deviceSignature = signature;
         this.log.debug(
           `Restoring channel ${channel.channelCaption} (${channel.deviceId}/${channel.channelId}) ` +
           `function=${channel.channelFunction} type=${channel.channelType}`,
         );
-        this.setupAccessory(channel, existingAccessory);
+        if (previousSignature !== signature || !wasConfigured) {
+          if (previousSignature && previousSignature !== signature) {
+            this.resetAccessoryServices(existingAccessory);
+          }
+          const configured = this.setupAccessory(channel, existingAccessory);
+          existingAccessory.context.deviceConfigured = configured;
+        }
+        this.api.updatePlatformAccessories([existingAccessory]);
         continue;
       }
 
@@ -175,9 +223,12 @@ export class SuplaPlatform implements DynamicPlatformPlugin {
 
       const accessory = new this.api.platformAccessory(channel.channelCaption, uuid);
       accessory.context.device = channel;
+      accessory.context.deviceSignature = this.getChannelSignature(channel);
       if (this.setupAccessory(channel, accessory)) {
+        accessory.context.deviceConfigured = true;
         this.api.registerPlatformAccessories(PLUGIN_NAME, PLATFORM_NAME, [accessory]);
         this.accessories.push(accessory);
+        this.api.updatePlatformAccessories([accessory]);
       }
     }
 
@@ -220,13 +271,16 @@ export class SuplaPlatform implements DynamicPlatformPlugin {
     try {
       const configPath = this.api.user.configPath();
       const config = JSON.parse(fs.readFileSync(configPath).toString());
-      const platformConfig = config.platforms?.find((platform) => platform.platform === 'SuplaPlatform');
+      const platformConfig = config.platforms?.find((platform) => platform.platform === PLATFORM_NAME);
       if (!platformConfig) {
-        this.log.warn('Failed to save channels: SuplaPlatform not found in config.');
+        this.log.warn(`Failed to save channels: ${PLATFORM_NAME} not found in config.`);
         return;
       }
       platformConfig.channels = JSON.stringify(channels);
-      fs.writeFileSync(configPath, JSON.stringify(config, null, 2));
+      const payload = JSON.stringify(config, null, 2);
+      const tempPath = `${configPath}.tmp`;
+      fs.writeFileSync(tempPath, payload);
+      fs.renameSync(tempPath, configPath);
       this.log.debug(`Saved ${channels.length} channels to config.`);
     } catch (error) {
       this.log.error(`Failed to save channels: ${(error as Error).message}`);
@@ -269,10 +323,33 @@ export class SuplaPlatform implements DynamicPlatformPlugin {
   }
 
   private getChannelUuid(channel: SuplaChannelContext): string {
-    const key = channel.deviceId && channel.channelId
-      ? `${channel.deviceId}:${channel.channelId}`
-      : (channel.topic || channel.channelCaption);
+    const deviceId = channel.deviceId;
+    const channelId = channel.channelId;
+    const hasIds = deviceId && channelId && deviceId !== 'unknown' && channelId !== 'unknown';
+    const key = hasIds
+      ? `${deviceId}:${channelId}`
+      : (channel.topic || channel.channelCaption || `${deviceId}:${channelId}`);
     return this.api.hap.uuid.generate(key);
+  }
+
+  private getChannelSignature(channel: SuplaChannelContext): string {
+    return [
+      channel.topic ?? '',
+      channel.channelFunction ?? '',
+      channel.channelType ?? '',
+      channel.deviceId ?? '',
+      channel.channelId ?? '',
+    ].join('|');
+  }
+
+  private resetAccessoryServices(accessory: PlatformAccessory) {
+    const keepUuid = this.Service.AccessoryInformation.UUID;
+    for (const service of accessory.services) {
+      if (service.UUID === keepUuid) {
+        continue;
+      }
+      accessory.removeService(service);
+    }
   }
 
   private setupAccessory(channel: SuplaChannelContext, accessory: PlatformAccessory): boolean {
@@ -498,89 +575,87 @@ export class SuplaPlatform implements DynamicPlatformPlugin {
   public registerMqttHandler(
     topic: string,
     handler: (message: Buffer, topic: string) => void,
-    ownerId?: string,
+    ownerId: string,
   ): () => void {
     if (!topic) {
       return () => undefined;
     }
     this.startMqttRouter();
-    const handlers = this.mqttHandlers.get(topic) ?? new Set();
+    const handlerMap = this.isWildcardTopic(topic) ? this.mqttWildcardHandlers : this.mqttHandlers;
+    const handlers = handlerMap.get(topic) ?? new Set();
     handlers.add(handler);
-    this.mqttHandlers.set(topic, handlers);
-    if (ownerId) {
-      const ownerTopics = this.mqttHandlerOwners.get(ownerId) ?? new Map();
-      const ownerHandlers = ownerTopics.get(topic) ?? new Set();
-      ownerHandlers.add(handler);
-      ownerTopics.set(topic, ownerHandlers);
-      this.mqttHandlerOwners.set(ownerId, ownerTopics);
-    }
-    if (!this.mqttSubscriptions.has(topic)) {
-      this.MqttClient.client.subscribe(topic, (err) => {
-        if (err) {
-          this.log.error(`MQTT subscribe failed for ${topic}: ${err.message}`);
-        }
-      });
-      this.mqttSubscriptions.add(topic);
-    }
+    handlerMap.set(topic, handlers);
+    const ownerTopics = this.mqttHandlerOwners.get(ownerId) ?? new Map();
+    const ownerHandlers = ownerTopics.get(topic) ?? new Set();
+    ownerHandlers.add(handler);
+    ownerTopics.set(topic, ownerHandlers);
+    this.mqttHandlerOwners.set(ownerId, ownerTopics);
+    this.mqttDesiredSubscriptions.add(topic);
+    this.ensureSubscribed(topic, false);
     return () => {
-      const active = this.mqttHandlers.get(topic);
+      this.removeHandler(topic, handler);
+      const ownerTopics = this.mqttHandlerOwners.get(ownerId);
+      const ownerHandlers = ownerTopics?.get(topic);
+      if (ownerHandlers) {
+        ownerHandlers.delete(handler);
+        if (ownerHandlers.size === 0) {
+          ownerTopics?.delete(topic);
+        }
+      }
+      if (ownerTopics && ownerTopics.size === 0) {
+        this.mqttHandlerOwners.delete(ownerId);
+      }
+    };
+  }
+
+  public registerOwnerCleanup(ownerId: string, cleanup: () => void): () => void {
+    const cleanups = this.ownerCleanups.get(ownerId) ?? new Set<() => void>();
+    cleanups.add(cleanup);
+    this.ownerCleanups.set(ownerId, cleanups);
+    return () => {
+      const active = this.ownerCleanups.get(ownerId);
       if (!active) {
         return;
       }
-      active.delete(handler);
-      if (ownerId) {
-        const ownerTopics = this.mqttHandlerOwners.get(ownerId);
-        const ownerHandlers = ownerTopics?.get(topic);
-        if (ownerHandlers) {
-          ownerHandlers.delete(handler);
-          if (ownerHandlers.size === 0) {
-            ownerTopics?.delete(topic);
-          }
-        }
-        if (ownerTopics && ownerTopics.size === 0) {
-          this.mqttHandlerOwners.delete(ownerId);
-        }
-      }
+      active.delete(cleanup);
       if (active.size === 0) {
-        this.mqttHandlers.delete(topic);
-        if (this.mqttSubscriptions.has(topic)) {
-          this.MqttClient.client.unsubscribe(topic, (err) => {
-            if (err) {
-              this.log.error(`MQTT unsubscribe failed for ${topic}: ${err.message}`);
-            }
-          });
-          this.mqttSubscriptions.delete(topic);
-        }
+        this.ownerCleanups.delete(ownerId);
       }
     };
   }
 
   private unregisterMqttHandlers(ownerId: string) {
+    this.runOwnerCleanup(ownerId);
     const ownerTopics = this.mqttHandlerOwners.get(ownerId);
     if (!ownerTopics) {
       return;
     }
     for (const [topic, handlers] of ownerTopics) {
-      const active = this.mqttHandlers.get(topic);
-      if (!active) {
-        continue;
-      }
       for (const handler of handlers) {
-        active.delete(handler);
-      }
-      if (active.size === 0) {
-        this.mqttHandlers.delete(topic);
-        if (this.mqttSubscriptions.has(topic)) {
-          this.MqttClient.client.unsubscribe(topic, (err) => {
-            if (err) {
-              this.log.error(`MQTT unsubscribe failed for ${topic}: ${err.message}`);
-            }
-          });
-          this.mqttSubscriptions.delete(topic);
-        }
+        this.removeHandler(topic, handler);
       }
     }
     this.mqttHandlerOwners.delete(ownerId);
+  }
+
+  private unregisterAllMqttHandlers() {
+    const ownerIds = new Set<string>([
+      ...this.mqttHandlerOwners.keys(),
+      ...this.ownerCleanups.keys(),
+    ]);
+    for (const ownerId of Array.from(ownerIds)) {
+      this.unregisterMqttHandlers(ownerId);
+    }
+    for (const topic of Array.from(this.mqttDesiredSubscriptions)) {
+      this.removeSubscription(topic);
+    }
+    this.mqttHandlers.clear();
+    this.mqttWildcardHandlers.clear();
+    this.mqttDesiredSubscriptions.clear();
+    this.mqttSubscriptions.clear();
+    this.mqttPendingSubscriptions.clear();
+    this.clearAllSubscriptionRetries();
+    this.ownerCleanups.clear();
   }
 
   public publishCommand(topic: string, payload: string | Buffer, callback?: (error?: Error) => void) {
@@ -617,6 +692,243 @@ export class SuplaPlatform implements DynamicPlatformPlugin {
     return false;
   }
 
+  private runOwnerCleanup(ownerId: string) {
+    const cleanups = this.ownerCleanups.get(ownerId);
+    if (!cleanups) {
+      return;
+    }
+    for (const cleanup of cleanups) {
+      try {
+        cleanup();
+      } catch (error) {
+        this.log.error(
+          `Owner cleanup error for ${ownerId}: ${(error as Error).message}`,
+        );
+      }
+    }
+    this.ownerCleanups.delete(ownerId);
+  }
+
+  private clearActiveSubscriptions() {
+    if (this.mqttSubscriptions.size > 0 || this.mqttPendingSubscriptions.size > 0) {
+      this.log.debug('MQTT connection lost; clearing active subscriptions.');
+    }
+    this.mqttSubscriptions.clear();
+    this.mqttPendingSubscriptions.clear();
+    this.clearAllSubscriptionRetries();
+  }
+
+  private clearAllSubscriptionRetries() {
+    for (const timer of this.mqttRetryTimers.values()) {
+      clearTimeout(timer);
+    }
+    this.mqttRetryTimers.clear();
+    this.mqttRetryState.clear();
+  }
+
+  private clearSubscriptionRetry(topic: string) {
+    const timer = this.mqttRetryTimers.get(topic);
+    if (timer) {
+      clearTimeout(timer);
+      this.mqttRetryTimers.delete(topic);
+    }
+    this.mqttRetryState.delete(topic);
+  }
+
+  private scheduleSubscriptionRetry(topic: string, reason: string, hardDeny: boolean) {
+    if (this.mqttRetryTimers.has(topic)) {
+      return;
+    }
+    if (!this.mqttDesiredSubscriptions.has(topic)) {
+      return;
+    }
+    const baseDelayMs = 2500;
+    const maxDelayMs = 60000;
+    const now = Date.now();
+    const state = this.mqttRetryState.get(topic) ?? {
+      attempt: 0,
+      delayMs: baseDelayMs,
+      lastLogAt: 0,
+      hardDenyCount: 0,
+      blockedUntil: 0,
+    };
+    if (hardDeny) {
+      state.hardDenyCount += 1;
+      if (state.hardDenyCount >= 3) {
+        state.blockedUntil = Math.max(state.blockedUntil, now + 5 * 60 * 1000);
+      }
+    }
+    const delayMs = state.delayMs;
+    const blockedDelayMs = state.blockedUntil > now ? state.blockedUntil - now : 0;
+    let scheduledDelayMs = delayMs;
+    if (blockedDelayMs > 0) {
+      scheduledDelayMs = blockedDelayMs;
+    } else {
+      const jitter = Math.round(delayMs * 0.2 * (Math.random() * 2 - 1));
+      scheduledDelayMs = Math.max(baseDelayMs, Math.min(maxDelayMs, delayMs + jitter));
+      state.delayMs = Math.min(maxDelayMs, Math.max(baseDelayMs, delayMs * 2));
+      state.attempt += 1;
+    }
+    this.mqttRetryState.set(topic, state);
+    this.log.debug(`Retrying MQTT subscribe for ${topic} in ${scheduledDelayMs}ms (${reason}).`);
+    const timer = setTimeout(() => {
+      this.mqttRetryTimers.delete(topic);
+      if (!this.mqttDesiredSubscriptions.has(topic)) {
+        return;
+      }
+      this.ensureSubscribed(topic, true);
+    }, scheduledDelayMs);
+    this.mqttRetryTimers.set(topic, timer);
+  }
+
+  private isSubscriptionGranted(topic: string, granted: Array<{topic: string; qos: number}> | undefined): boolean {
+    if (!Array.isArray(granted) || granted.length === 0) {
+      return true;
+    }
+    const entry = granted.find((item) => item.topic === topic);
+    if (!entry) {
+      return false;
+    }
+    return entry.qos === 0 || entry.qos === 1 || entry.qos === 2;
+  }
+
+  private logSubscriptionIssue(topic: string, message: string) {
+    const now = Date.now();
+    const state = this.mqttRetryState.get(topic) ?? {
+      attempt: 0,
+      delayMs: 2500,
+      lastLogAt: 0,
+      hardDenyCount: 0,
+      blockedUntil: 0,
+    };
+    const shouldLog = state.lastLogAt === 0 || now - state.lastLogAt > 60000;
+    if (shouldLog) {
+      this.log.error(message);
+      state.lastLogAt = now;
+    } else {
+      this.log.debug(message);
+    }
+    this.mqttRetryState.set(topic, state);
+  }
+
+  private ensureSubscribed(topic: string, force: boolean) {
+    if (!this.MqttClient) {
+      return;
+    }
+    if (!this.MqttClient.client.connected) {
+      return;
+    }
+    if (!this.mqttDesiredSubscriptions.has(topic)) {
+      return;
+    }
+    if (!force && (this.mqttSubscriptions.has(topic) || this.mqttPendingSubscriptions.has(topic))) {
+      return;
+    }
+    if (this.mqttPendingSubscriptions.has(topic)) {
+      return;
+    }
+    this.mqttPendingSubscriptions.add(topic);
+    this.MqttClient.client.subscribe(topic, (err, granted) => {
+      this.mqttPendingSubscriptions.delete(topic);
+      if (err) {
+        this.logSubscriptionIssue(topic, `MQTT subscribe failed for ${topic}: ${err.message}`);
+        this.mqttSubscriptions.delete(topic);
+        this.scheduleSubscriptionRetry(topic, 'error', false);
+        return;
+      }
+      if (!this.isSubscriptionGranted(topic, granted)) {
+        this.logSubscriptionIssue(topic, `MQTT subscription denied for ${topic}.`);
+        this.mqttSubscriptions.delete(topic);
+        this.scheduleSubscriptionRetry(topic, 'denied', true);
+        return;
+      }
+      if (!this.mqttDesiredSubscriptions.has(topic)) {
+        this.mqttSubscriptions.delete(topic);
+        this.clearSubscriptionRetry(topic);
+        if (this.MqttClient.client.connected) {
+          this.MqttClient.client.unsubscribe(topic, (unsubscribeErr) => {
+            if (unsubscribeErr) {
+              this.log.error(`MQTT unsubscribe failed for ${topic}: ${unsubscribeErr.message}`);
+            }
+          });
+        }
+        return;
+      }
+      this.clearSubscriptionRetry(topic);
+      this.mqttSubscriptions.add(topic);
+    });
+  }
+
+  private resubscribeAll(force: boolean) {
+    if (!this.MqttClient) {
+      return;
+    }
+    if (force) {
+      this.mqttPendingSubscriptions.clear();
+    }
+    for (const topic of this.mqttDesiredSubscriptions) {
+      this.ensureSubscribed(topic, force);
+    }
+  }
+
+  private removeSubscription(topic: string) {
+    this.mqttDesiredSubscriptions.delete(topic);
+    this.mqttPendingSubscriptions.delete(topic);
+    this.clearSubscriptionRetry(topic);
+    if (!this.MqttClient) {
+      return;
+    }
+    if (this.mqttSubscriptions.has(topic)) {
+      this.MqttClient.client.unsubscribe(topic, (err) => {
+        if (err) {
+          this.log.error(`MQTT unsubscribe failed for ${topic}: ${err.message}`);
+        }
+      });
+      this.mqttSubscriptions.delete(topic);
+    }
+  }
+
+  private removeHandler(topic: string, handler: (message: Buffer, topic: string) => void) {
+    const handlerMap = this.isWildcardTopic(topic) ? this.mqttWildcardHandlers : this.mqttHandlers;
+    const active = handlerMap.get(topic);
+    if (!active) {
+      return;
+    }
+    active.delete(handler);
+    if (active.size === 0) {
+      handlerMap.delete(topic);
+      this.removeSubscription(topic);
+    }
+  }
+
+  private isWildcardTopic(topic: string): boolean {
+    return topic.includes('+') || topic.includes('#');
+  }
+
+  private topicMatchesFilter(topic: string, filter: string): boolean {
+    if (filter === topic) {
+      return true;
+    }
+    const filterParts = filter.split('/');
+    const topicParts = topic.split('/');
+    for (let i = 0; i < filterParts.length; i += 1) {
+      const filterPart = filterParts[i];
+      if (filterPart === '#') {
+        return i === filterParts.length - 1;
+      }
+      if (i >= topicParts.length) {
+        return false;
+      }
+      if (filterPart === '+') {
+        continue;
+      }
+      if (filterPart !== topicParts[i]) {
+        return false;
+      }
+    }
+    return filterParts.length === topicParts.length;
+  }
+
   private normalizeCommandQos(value?: number): 0 | 1 | 2 {
     const parsed = Number(value);
     if (parsed === 1 || parsed === 2) {
@@ -630,18 +942,37 @@ export class SuplaPlatform implements DynamicPlatformPlugin {
       return;
     }
     this.mqttRouterAttached = true;
+    this.resubscribeAll(false);
     this.MqttClient.client.on('message', (topic, message) => {
-      const handlers = this.mqttHandlers.get(topic);
-      if (!handlers) {
-        return;
-      }
-      for (const handler of handlers) {
+      const dispatched = new Set<(message: Buffer, topic: string) => void>();
+      const dispatch = (handler: (message: Buffer, topic: string) => void, label: string) => {
+        if (dispatched.has(handler)) {
+          return;
+        }
+        dispatched.add(handler);
         try {
           handler(message, topic);
         } catch (error) {
           this.log.error(
-            `MQTT handler error for ${topic}: ${(error as Error).message}`,
+            `MQTT handler error for ${label}: ${(error as Error).message}`,
           );
+        }
+      };
+      const exactHandlers = this.mqttHandlers.get(topic);
+      if (exactHandlers) {
+        for (const handler of exactHandlers) {
+          dispatch(handler, topic);
+        }
+      }
+      if (this.mqttWildcardHandlers.size === 0) {
+        return;
+      }
+      for (const [filter, handlers] of this.mqttWildcardHandlers) {
+        if (!this.topicMatchesFilter(topic, filter)) {
+          continue;
+        }
+        for (const handler of handlers) {
+          dispatch(handler, filter);
         }
       }
     });

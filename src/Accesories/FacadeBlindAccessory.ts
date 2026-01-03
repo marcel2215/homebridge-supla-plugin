@@ -53,6 +53,10 @@ export class FacadeBlindAccessory {
       .onSet(this.handleHoldPositionSet.bind(this));
     this.service.setCharacteristic(this.platform.Characteristic.StatusJammed, 0);
 
+    this.platform.registerOwnerCleanup(this.accessory.UUID, () => {
+      this.disposeTimers();
+    });
+
     this.platform.registerMqttHandler(
       `${this.context.topic}/state/shut`,
       (message) => {
@@ -351,6 +355,12 @@ export class FacadeBlindAccessory {
       clearTimeout(this.motionStopTimer);
       this.motionStopTimer = undefined;
     }
+  }
+
+  private disposeTimers() {
+    this.clearPendingTarget(false);
+    this.clearStopTimer();
+    this.clearMotionStopTimer();
   }
 
   private setJammed(isJammed: boolean) {

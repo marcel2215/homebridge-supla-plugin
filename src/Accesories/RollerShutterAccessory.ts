@@ -44,6 +44,10 @@ export class RollerShutterAccessory {
       .onSet(this.handleHoldPositionSet.bind(this));
     this.service.setCharacteristic(this.platform.Characteristic.StatusJammed, 0);
 
+    this.platform.registerOwnerCleanup(this.accessory.UUID, () => {
+      this.disposeTimers();
+    });
+
     this.legacyMode = this.isLegacyTopic();
     const statusTopic = this.legacyMode
       ? this.getLegacyStatusTopic()
@@ -436,6 +440,12 @@ export class RollerShutterAccessory {
       clearTimeout(this.motionStopTimer);
       this.motionStopTimer = undefined;
     }
+  }
+
+  private disposeTimers() {
+    this.clearPendingTarget(false);
+    this.clearStopTimer();
+    this.clearMotionStopTimer();
   }
 
   private setJammed(isJammed: boolean) {

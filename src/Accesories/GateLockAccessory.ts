@@ -38,6 +38,10 @@ export class GateLockAccessory {
       .onGet(this.handleTargetStateGet.bind(this))
       .onSet(this.handleTargetStateSet.bind(this));
 
+    this.platform.registerOwnerCleanup(this.accessory.UUID, () => {
+      this.clearPulseTimer();
+    });
+
     this.platform.registerMqttHandler(
       `${this.context.topic}/state/hi`,
       (message) => {
@@ -80,10 +84,7 @@ export class GateLockAccessory {
     if (target !== this.platform.Characteristic.LockTargetState.UNSECURED) {
       return;
     }
-    if (this.pulseTimer) {
-      clearTimeout(this.pulseTimer);
-      this.pulseTimer = undefined;
-    }
+    this.clearPulseTimer();
 
     const mode = this.platform.getGateLockControlMode();
     if (mode === 'set_on_pulse') {
@@ -120,5 +121,12 @@ export class GateLockAccessory {
     );
     this.currentState = this.platform.Characteristic.LockCurrentState.UNSECURED;
     this.service.updateCharacteristic(this.platform.Characteristic.LockCurrentState, this.currentState);
+  }
+
+  private clearPulseTimer() {
+    if (this.pulseTimer) {
+      clearTimeout(this.pulseTimer);
+      this.pulseTimer = undefined;
+    }
   }
 }

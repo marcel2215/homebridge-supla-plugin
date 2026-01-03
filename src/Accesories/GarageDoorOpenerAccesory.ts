@@ -7,6 +7,7 @@ export class GarageDoorOpenerAccesory {
   private service: Service;
   private state = this.platform.Characteristic.CurrentDoorState.CLOSED;
   private connected = true;
+  private updateTimer?: NodeJS.Timeout;
 
   constructor(
         private readonly platform: SuplaPlatform,
@@ -31,6 +32,10 @@ export class GarageDoorOpenerAccesory {
 
         this.service.getCharacteristic(this.platform.Characteristic.ObstructionDetected)
           .onGet(this.handleObstructionDetectedGet.bind(this));
+
+        this.platform.registerOwnerCleanup(this.accessory.UUID, () => {
+          this.clearUpdateTimer();
+        });
 
         this.platform.registerMqttHandler(
           `${this.context.topic}/state/hi`,
@@ -80,13 +85,21 @@ export class GarageDoorOpenerAccesory {
         `${this.context.topic}/execute_action`,
         'close');
     }
-    setTimeout(() => {
+    this.clearUpdateTimer();
+    this.updateTimer = setTimeout(() => {
       this.service.updateCharacteristic(this.platform.Characteristic.CurrentDoorState, this.state);
     }, 300);
   }
 
   async handleObstructionDetectedGet(): Promise<CharacteristicValue> {
     return 0;
+  }
+
+  private clearUpdateTimer() {
+    if (this.updateTimer) {
+      clearTimeout(this.updateTimer);
+      this.updateTimer = undefined;
+    }
   }
 
 }

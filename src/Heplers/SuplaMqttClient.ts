@@ -4,6 +4,8 @@ import {Logger} from 'homebridge';
 import {SuplaMqttClientContext} from './SuplaMqttClientContext';
 import {SuplaChannelContext} from './SuplaChannelContext';
 
+type RegisterHandler = (topic: string, handler: (message: Buffer, topic: string) => void) => () => void;
+
 export class SuplaMqttClient {
   public client: MqttClient;
   constructor(
@@ -12,6 +14,7 @@ export class SuplaMqttClient {
     const options: mqtt.IClientOptions = {
       username: context.username,
       password: context.password,
+      resubscribe: false,
     };
     const protocol = this.resolveProtocol();
     if (this.usesTls(protocol)) {
@@ -45,24 +48,24 @@ export class SuplaMqttClient {
     });
   }
 
-  public async discoverChannelsAsync() : Promise<Array<SuplaChannelContext>> {
+  public async discoverChannelsAsync(registerHandler?: RegisterHandler) : Promise<Array<SuplaChannelContext>> {
     const topicScheme = this.resolveTopicScheme();
     this.log.debug(`MQTT topic scheme: ${topicScheme}`);
     if (topicScheme === 'legacy') {
-      return this.discoverLegacyRollerShuttersAsync();
+      return this.discoverLegacyRollerShuttersAsync(registerHandler);
     }
     if (topicScheme === 'cloud') {
-      return this.discoverCloudChannelsAsync();
+      return this.discoverCloudChannelsAsync(registerHandler);
     }
-    const cloudChannels = await this.discoverCloudChannelsAsync();
+    const cloudChannels = await this.discoverCloudChannelsAsync(registerHandler);
     if (cloudChannels.length > 0) {
       return cloudChannels;
     }
     this.log.warn('No channels discovered via cloud topics; trying legacy rollershutter topics.');
-    return this.discoverLegacyRollerShuttersAsync();
+    return this.discoverLegacyRollerShuttersAsync(registerHandler);
   }
 
-  private async discoverCloudChannelsAsync(): Promise<Array<SuplaChannelContext>> {
+  private async discoverCloudChannelsAsync(registerHandler?: RegisterHandler): Promise<Array<SuplaChannelContext>> {
     const subscriptionTopic = `supla/${this.context.username}/devices/+/channels/#`;
     const includeHidden = this.resolveIncludeHidden();
     const usernamePattern = this.escapeRegex(this.context.username);
@@ -119,25 +122,39 @@ export class SuplaMqttClient {
       }
       quietTimer = setTimeout(() => resolveDone?.(), quietWindowMs);
     };
-
-    this.client.subscribe(subscriptionTopic, (err) => {
-      if (err) {
-        this.log.error(`MQTT subscribe failed for ${subscriptionTopic}: ${err.message}`);
-        resolveDone?.();
-      }
-    });
-    this.client.on('message', messageHandler);
-    await discoveryDone;
-    clearTimeout(maxTimer);
-    if (quietTimer) {
-      clearTimeout(quietTimer);
+    let cleanup: (() => void) | undefined;
+    if (registerHandler) {
+      cleanup = registerHandler(subscriptionTopic, (message, topic) => {
+        messageHandler(topic, message);
+      });
+    } else {
+      this.client.subscribe(subscriptionTopic, (err) => {
+        if (err) {
+          this.log.error(`MQTT subscribe failed for ${subscriptionTopic}: ${err.message}`);
+          resolveDone?.();
+        }
+      });
+      this.client.on('message', messageHandler);
+      cleanup = () => {
+        this.client.removeListener('message', messageHandler);
+        this.client.unsubscribe(subscriptionTopic, (err) => {
+          if (err) {
+            this.log.error(`MQTT unsubscribe failed for ${subscriptionTopic}: ${err.message}`);
+          }
+        });
+      };
     }
-    this.client.removeListener('message', messageHandler);
-    this.client.unsubscribe(subscriptionTopic, (err) => {
-      if (err) {
-        this.log.error(`MQTT unsubscribe failed for ${subscriptionTopic}: ${err.message}`);
+    try {
+      await discoveryDone;
+    } finally {
+      clearTimeout(maxTimer);
+      if (quietTimer) {
+        clearTimeout(quietTimer);
       }
-    });
+      if (cleanup) {
+        cleanup();
+      }
+    }
 
     const result : Array<SuplaChannelContext> = [];
     let skippedHidden = 0;
@@ -183,7 +200,7 @@ export class SuplaMqttClient {
     return result;
   }
 
-  private async discoverLegacyRollerShuttersAsync(): Promise<Array<SuplaChannelContext>> {
+  private async discoverLegacyRollerShuttersAsync(registerHandler?: RegisterHandler): Promise<Array<SuplaChannelContext>> {
     const subscriptionTopic = 'supla/channels/status/rollershutter/#';
     this.log.info('Discovering legacy rollershutter channels via MQTT');
     this.log.debug(`Discovery subscribe topic: ${subscriptionTopic}`);
@@ -226,25 +243,39 @@ export class SuplaMqttClient {
       }
       quietTimer = setTimeout(() => resolveDone?.(), quietWindowMs);
     };
-
-    this.client.subscribe(subscriptionTopic, (err) => {
-      if (err) {
-        this.log.error(`MQTT subscribe failed for ${subscriptionTopic}: ${err.message}`);
-        resolveDone?.();
-      }
-    });
-    this.client.on('message', messageHandler);
-    await discoveryDone;
-    clearTimeout(maxTimer);
-    if (quietTimer) {
-      clearTimeout(quietTimer);
+    let cleanup: (() => void) | undefined;
+    if (registerHandler) {
+      cleanup = registerHandler(subscriptionTopic, (message, topic) => {
+        messageHandler(topic, message);
+      });
+    } else {
+      this.client.subscribe(subscriptionTopic, (err) => {
+        if (err) {
+          this.log.error(`MQTT subscribe failed for ${subscriptionTopic}: ${err.message}`);
+          resolveDone?.();
+        }
+      });
+      this.client.on('message', messageHandler);
+      cleanup = () => {
+        this.client.removeListener('message', messageHandler);
+        this.client.unsubscribe(subscriptionTopic, (err) => {
+          if (err) {
+            this.log.error(`MQTT unsubscribe failed for ${subscriptionTopic}: ${err.message}`);
+          }
+        });
+      };
     }
-    this.client.removeListener('message', messageHandler);
-    this.client.unsubscribe(subscriptionTopic, (err) => {
-      if (err) {
-        this.log.error(`MQTT unsubscribe failed for ${subscriptionTopic}: ${err.message}`);
+    try {
+      await discoveryDone;
+    } finally {
+      clearTimeout(maxTimer);
+      if (quietTimer) {
+        clearTimeout(quietTimer);
       }
-    });
+      if (cleanup) {
+        cleanup();
+      }
+    }
 
     const result: Array<SuplaChannelContext> = [];
     for (const entry of channelMap.values()) {
