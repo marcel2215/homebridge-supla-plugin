@@ -55,6 +55,7 @@ export class SuplaPlatform implements DynamicPlatformPlugin {
   private readonly gateLockPulseSeconds: number;
   private readonly gateLockSetOnPayload: string;
   private readonly gateLockSetOffPayload: string;
+  private readonly gatePartialHiMode: 'moving' | 'open_endstop' | 'pedestrian_endstop' | 'ignore';
   private readonly commandQos: 0 | 1 | 2;
   private readonly commandRetain: boolean;
   private readonly mqttHandlers = new Map<string, Set<(message: Buffer, topic: string) => void>>();
@@ -99,6 +100,7 @@ export class SuplaPlatform implements DynamicPlatformPlugin {
       gateLockPulseSeconds?: number;
       gateLockSetOnPayload?: string;
       gateLockSetOffPayload?: string;
+      gatePartialHiMode?: string;
       commandQos?: number;
       commandRetain?: boolean | string;
     };
@@ -119,6 +121,7 @@ export class SuplaPlatform implements DynamicPlatformPlugin {
     this.gateLockPulseSeconds = Number(configView.gateLockPulseSeconds) || 0;
     this.gateLockSetOnPayload = (configView.gateLockSetOnPayload ?? 'true').toString();
     this.gateLockSetOffPayload = (configView.gateLockSetOffPayload ?? 'false').toString();
+    this.gatePartialHiMode = this.normalizeGatePartialHiMode(configView.gatePartialHiMode);
     this.commandQos = this.normalizeCommandQos(configView.commandQos);
     this.commandRetain = this.parseBoolean(configView.commandRetain ?? false);
 
@@ -541,6 +544,10 @@ export class SuplaPlatform implements DynamicPlatformPlugin {
     return this.gateLockSetOffPayload;
   }
 
+  public getGatePartialHiMode(): 'moving' | 'open_endstop' | 'pedestrian_endstop' | 'ignore' {
+    return this.gatePartialHiMode;
+  }
+
   private normalizeCoveringControlMode(value?: string): 'set' | 'execute_action' | 'hybrid' {
     const normalized = (value ?? 'set').toString().toLowerCase();
     if (normalized === 'execute_action') {
@@ -566,6 +573,22 @@ export class SuplaPlatform implements DynamicPlatformPlugin {
       return 'set_on_pulse';
     }
     return 'execute_action';
+  }
+
+  private normalizeGatePartialHiMode(
+    value?: string,
+  ): 'moving' | 'open_endstop' | 'pedestrian_endstop' | 'ignore' {
+    const normalized = (value ?? 'moving').toString().toLowerCase();
+    if (normalized === 'open_endstop' || normalized === 'open') {
+      return 'open_endstop';
+    }
+    if (normalized === 'pedestrian_endstop' || normalized === 'pedestrian') {
+      return 'pedestrian_endstop';
+    }
+    if (normalized === 'ignore' || normalized === 'absent') {
+      return 'ignore';
+    }
+    return 'moving';
   }
 
   private normalizeTopicSuffix(value: string): string {

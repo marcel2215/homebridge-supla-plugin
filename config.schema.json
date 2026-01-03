@@ -82,6 +82,17 @@
       "type": "string",
       "default": "toggle"
     },
+    "gatePartialHiMode": {
+      "title": "Gate Partial Hi Mode",
+      "type": "string",
+      "default": "moving",
+      "enum": [
+        "moving",
+        "open_endstop",
+        "pedestrian_endstop",
+        "ignore"
+      ]
+    },
     "gateLockControlMode": {
       "title": "Gate Lock Control Mode",
       "type": "string",
