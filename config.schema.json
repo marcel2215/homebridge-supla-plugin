@@ -58,6 +58,64 @@
         "auto"
       ]
     },
+    "gateControlMode": {
+      "title": "Gate Control Mode",
+      "type": "string",
+      "default": "execute_action",
+      "enum": [
+        "execute_action",
+        "toggle"
+      ]
+    },
+    "gateExecuteActionOpen": {
+      "title": "Gate Execute Action Open",
+      "type": "string",
+      "default": "open"
+    },
+    "gateExecuteActionClose": {
+      "title": "Gate Execute Action Close",
+      "type": "string",
+      "default": "close"
+    },
+    "gateExecuteActionToggle": {
+      "title": "Gate Execute Action Toggle",
+      "type": "string",
+      "default": "toggle"
+    },
+    "gateLockControlMode": {
+      "title": "Gate Lock Control Mode",
+      "type": "string",
+      "default": "execute_action",
+      "enum": [
+        "execute_action",
+        "set_on_pulse"
+      ]
+    },
+    "gateLockExecuteAction": {
+      "title": "Gate Lock Execute Action",
+      "type": "string",
+      "default": "open"
+    },
+    "gateLockSetTopicSuffix": {
+      "title": "Gate Lock Set Topic Suffix",
+      "type": "string",
+      "default": "set/on"
+    },
+    "gateLockPulseSeconds": {
+      "title": "Gate Lock Pulse Seconds",
+      "type": "number",
+      "default": 0
+    },
+    "gateLockSetOnPayload": {
+      "title": "Gate Lock Set On Payload",
+      "type": "string",
+      "default": "true"
+    },
+    "gateLockSetOffPayload": {
+      "title": "Gate Lock Set Off Payload",
+      "type": "string",
+      "default": "false"
+    },
     "coveringControlMode": {
       "title": "Covering Control Mode",
       "type": "string",

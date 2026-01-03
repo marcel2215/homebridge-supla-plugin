@@ -6,7 +6,8 @@ import { LightAccesory } from './Accesories/LightBulbAccesory';
 import * as fs from 'fs';
 import {SuplaMqttClient} from './Heplers/SuplaMqttClient';
 import {RGBLightAccesory} from './Accesories/RGBLightBulbAccesory';
-import {DoorAccessory} from './Accesories/DoorAccessory';
+import {GateAccessory} from './Accesories/GateAccessory';
+import {GateLockAccessory} from './Accesories/GateLockAccessory';
 import {SuplaMqttClientContext} from './Heplers/SuplaMqttClientContext';
 import {SuplaChannelContext} from './Heplers/SuplaChannelContext';
 import {DimmerAccessory} from './Accesories/DimmerAccessory';
@@ -44,6 +45,16 @@ export class SuplaPlatform implements DynamicPlatformPlugin {
   private readonly coveringExecuteActionClose: string;
   private readonly coveringExecuteActionStop: string;
   private readonly coveringTravelTimeSeconds: number;
+  private readonly gateControlMode: 'execute_action' | 'toggle';
+  private readonly gateExecuteActionOpen: string;
+  private readonly gateExecuteActionClose: string;
+  private readonly gateExecuteActionToggle: string;
+  private readonly gateLockControlMode: 'execute_action' | 'set_on_pulse';
+  private readonly gateLockExecuteAction: string;
+  private readonly gateLockSetTopicSuffix: string;
+  private readonly gateLockPulseSeconds: number;
+  private readonly gateLockSetOnPayload: string;
+  private readonly gateLockSetOffPayload: string;
   private readonly mqttHandlers = new Map<string, Set<(message: Buffer, topic: string) => void>>();
   private readonly mqttSubscriptions = new Set<string>();
   private mqttRouterAttached = false;
@@ -62,6 +73,16 @@ export class SuplaPlatform implements DynamicPlatformPlugin {
       coveringExecuteActionClose?: string;
       coveringExecuteActionStop?: string;
       coveringTravelTimeSeconds?: number;
+      gateControlMode?: string;
+      gateExecuteActionOpen?: string;
+      gateExecuteActionClose?: string;
+      gateExecuteActionToggle?: string;
+      gateLockControlMode?: string;
+      gateLockExecuteAction?: string;
+      gateLockSetTopicSuffix?: string;
+      gateLockPulseSeconds?: number;
+      gateLockSetOnPayload?: string;
+      gateLockSetOffPayload?: string;
     };
     this.coveringControlMode = this.normalizeCoveringControlMode(configView.coveringControlMode);
     this.coveringSetTopicSuffix = this.normalizeTopicSuffix(configView.coveringSetTopicSuffix || 'set/closing_percentage');
@@ -70,6 +91,16 @@ export class SuplaPlatform implements DynamicPlatformPlugin {
     this.coveringExecuteActionClose = (configView.coveringExecuteActionClose || 'shut').toString();
     this.coveringExecuteActionStop = (configView.coveringExecuteActionStop || 'stop').toString();
     this.coveringTravelTimeSeconds = Number(configView.coveringTravelTimeSeconds) || 0;
+    this.gateControlMode = this.normalizeGateControlMode(configView.gateControlMode);
+    this.gateExecuteActionOpen = (configView.gateExecuteActionOpen || 'open').toString();
+    this.gateExecuteActionClose = (configView.gateExecuteActionClose || 'close').toString();
+    this.gateExecuteActionToggle = (configView.gateExecuteActionToggle || 'toggle').toString();
+    this.gateLockControlMode = this.normalizeGateLockControlMode(configView.gateLockControlMode);
+    this.gateLockExecuteAction = (configView.gateLockExecuteAction || 'open').toString();
+    this.gateLockSetTopicSuffix = this.normalizeTopicSuffix(configView.gateLockSetTopicSuffix || 'set/on');
+    this.gateLockPulseSeconds = Number(configView.gateLockPulseSeconds) || 0;
+    this.gateLockSetOnPayload = (configView.gateLockSetOnPayload ?? 'true').toString();
+    this.gateLockSetOffPayload = (configView.gateLockSetOffPayload ?? 'false').toString();
 
     this.api.on('didFinishLaunching', () => {
       log.debug('Executed didFinishLaunching callback');
@@ -246,8 +277,10 @@ export class SuplaPlatform implements DynamicPlatformPlugin {
         new GarageDoorOpenerAccesory(this, accessory, channel);
         return true;
       case 'CONTROLLINGTHEGATE':
+        new GateAccessory(this, accessory, channel);
+        return true;
       case 'CONTROLLINGTHEGATEWAYLOCK':
-        new DoorAccessory(this, accessory, channel);
+        new GateLockAccessory(this, accessory, channel);
         return true;
       case 'LIGHTSWITCH':
         new LightAccesory(this, accessory, channel);
@@ -382,6 +415,46 @@ export class SuplaPlatform implements DynamicPlatformPlugin {
     return this.coveringTravelTimeSeconds;
   }
 
+  public getGateControlMode(): 'execute_action' | 'toggle' {
+    return this.gateControlMode;
+  }
+
+  public getGateExecuteActionOpen(): string {
+    return this.gateExecuteActionOpen;
+  }
+
+  public getGateExecuteActionClose(): string {
+    return this.gateExecuteActionClose;
+  }
+
+  public getGateExecuteActionToggle(): string {
+    return this.gateExecuteActionToggle;
+  }
+
+  public getGateLockControlMode(): 'execute_action' | 'set_on_pulse' {
+    return this.gateLockControlMode;
+  }
+
+  public getGateLockExecuteAction(): string {
+    return this.gateLockExecuteAction;
+  }
+
+  public getGateLockSetTopicSuffix(): string {
+    return this.gateLockSetTopicSuffix;
+  }
+
+  public getGateLockPulseSeconds(): number {
+    return this.gateLockPulseSeconds;
+  }
+
+  public getGateLockSetOnPayload(): string {
+    return this.gateLockSetOnPayload;
+  }
+
+  public getGateLockSetOffPayload(): string {
+    return this.gateLockSetOffPayload;
+  }
+
   private normalizeCoveringControlMode(value?: string): 'set' | 'execute_action' | 'hybrid' {
     const normalized = (value ?? 'set').toString().toLowerCase();
     if (normalized === 'execute_action') {
@@ -391,6 +464,22 @@ export class SuplaPlatform implements DynamicPlatformPlugin {
       return 'hybrid';
     }
     return 'set';
+  }
+
+  private normalizeGateControlMode(value?: string): 'execute_action' | 'toggle' {
+    const normalized = (value ?? 'execute_action').toString().toLowerCase();
+    if (normalized === 'toggle') {
+      return 'toggle';
+    }
+    return 'execute_action';
+  }
+
+  private normalizeGateLockControlMode(value?: string): 'execute_action' | 'set_on_pulse' {
+    const normalized = (value ?? 'execute_action').toString().toLowerCase();
+    if (normalized === 'set_on_pulse') {
+      return 'set_on_pulse';
+    }
+    return 'execute_action';
   }
 
   private normalizeTopicSuffix(value: string): string {
