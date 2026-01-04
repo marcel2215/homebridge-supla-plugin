@@ -21,7 +21,7 @@ export class GateAccessory {
   private readonly partialHiMode: PartialHiMode;
   private readonly baseTopic: string;
   private reverseToggleTimer?: NodeJS.Timeout;
-  private readonly reverseToggleDelayMs = 350;
+  private readonly reverseToggleDelayMs = 1200;
 
   constructor(
     private readonly platform: SuplaPlatform,
@@ -107,7 +107,18 @@ export class GateAccessory {
   }
 
   async handleTargetDoorStateSet(value: CharacteristicValue) {
-    const target = value as number;
+    const requestedTarget = value as number;
+    const mode = this.platform.getGateControlMode();
+    const motionTarget = this.getMotionTarget();
+    const isMoving = this.currentState === this.platform.Characteristic.CurrentDoorState.OPENING
+      || this.currentState === this.platform.Characteristic.CurrentDoorState.CLOSING;
+    let target = requestedTarget;
+    // HomeKit can resend the same target while moving; treat it as a reverse for toggle gates.
+    if (mode === 'toggle' && isMoving && motionTarget !== undefined && requestedTarget === motionTarget) {
+      target = requestedTarget === this.platform.Characteristic.TargetDoorState.OPEN
+        ? this.platform.Characteristic.TargetDoorState.CLOSED
+        : this.platform.Characteristic.TargetDoorState.OPEN;
+    }
     const previousTarget = this.targetState;
     this.setTargetState(target);
     this.clearReverseToggleTimer();
@@ -119,7 +130,6 @@ export class GateAccessory {
       return;
     }
 
-    const mode = this.platform.getGateControlMode();
     if (mode === 'toggle' && this.isAtTarget(target)) {
       return;
     }
@@ -141,7 +151,6 @@ export class GateAccessory {
       this.setTargetState(previousTarget);
       return;
     }
-    const motionTarget = this.getMotionTarget();
     const isReversing = motionTarget !== undefined && motionTarget !== target;
     this.publishGateAction(action, isReversing && mode === 'toggle' ? 'reverse' : undefined);
     if (mode === 'toggle' && isReversing) {
@@ -231,13 +240,13 @@ export class GateAccessory {
       return;
     }
 
-    this.pendingTarget = undefined;
+    if (this.pendingTarget !== undefined) {
+      this.setCurrentState(this.resolveMovingState());
+      return;
+    }
     this.clearTransitionTimer();
     this.clearReverseToggleTimer();
-    this.applyDoorState(
-      this.platform.Characteristic.CurrentDoorState.OPEN,
-      this.platform.Characteristic.TargetDoorState.OPEN,
-    );
+    this.setCurrentState(this.platform.Characteristic.CurrentDoorState.STOPPED);
   }
 
   private isAtTarget(target: number): boolean {
@@ -272,7 +281,8 @@ export class GateAccessory {
       if (!this.hasClosedSensorState) {
         return false;
       }
-      return !this.isClosedSensorActive;
+      return this.currentState === this.platform.Characteristic.CurrentDoorState.OPEN
+        && !this.isClosedSensorActive;
     }
     return false;
   }
