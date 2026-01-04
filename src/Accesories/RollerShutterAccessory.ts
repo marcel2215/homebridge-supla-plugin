@@ -10,6 +10,7 @@ export class RollerShutterAccessory {
   private connected = true;
   private stopTimer?: NodeJS.Timeout;
   private legacyMode = false;
+  private readonly baseTopic: string;
   private hasReceivedPosition = false;
   private pendingTargetPosition?: number;
   private pendingTargetExpiresAt = 0;
@@ -33,16 +34,24 @@ export class RollerShutterAccessory {
 
     this.service.setCharacteristic(this.platform.Characteristic.Name, accessory.displayName);
 
-    this.service.getCharacteristic(this.platform.Characteristic.CurrentPosition)
-      .onGet(this.handleCurrentPositionGet.bind(this));
-    this.service.getCharacteristic(this.platform.Characteristic.TargetPosition)
-      .setProps({ minValue: 0, maxValue: 100, minStep: 1 })
+    const currentPosition = this.service.getCharacteristic(this.platform.Characteristic.CurrentPosition);
+    currentPosition.removeOnGet();
+    currentPosition.onGet(this.handleCurrentPositionGet.bind(this));
+
+    const targetPosition = this.service.getCharacteristic(this.platform.Characteristic.TargetPosition);
+    targetPosition.removeOnGet();
+    targetPosition.removeOnSet();
+    targetPosition.setProps({ minValue: 0, maxValue: 100, minStep: 1 })
       .onGet(this.handleTargetPositionGet.bind(this))
       .onSet(this.handleTargetPositionSet.bind(this));
-    this.service.getCharacteristic(this.platform.Characteristic.PositionState)
-      .onGet(this.handlePositionStateGet.bind(this));
-    this.service.getCharacteristic(this.platform.Characteristic.HoldPosition)
-      .onSet(this.handleHoldPositionSet.bind(this));
+
+    const positionState = this.service.getCharacteristic(this.platform.Characteristic.PositionState);
+    positionState.removeOnGet();
+    positionState.onGet(this.handlePositionStateGet.bind(this));
+
+    const holdPosition = this.service.getCharacteristic(this.platform.Characteristic.HoldPosition);
+    holdPosition.removeOnSet();
+    holdPosition.onSet(this.handleHoldPositionSet.bind(this));
     this.service.setCharacteristic(this.platform.Characteristic.StatusJammed, 0);
 
     this.platform.registerOwnerCleanup(this.accessory.UUID, () => {
@@ -50,12 +59,13 @@ export class RollerShutterAccessory {
     });
 
     this.legacyMode = this.isLegacyTopic();
+    this.baseTopic = this.platform.normalizeTopicBase(this.context.topic);
     const statusTopic = this.legacyMode
       ? this.getLegacyStatusTopic()
-      : `${this.context.topic}/state/shut`;
+      : `${this.baseTopic}/state/shut`;
     const connectedTopic = this.legacyMode
       ? undefined
-      : `${this.context.topic}/state/connected`;
+      : `${this.baseTopic}/state/connected`;
 
     this.platform.log.debug(
       `RollerShutter ${this.accessory.displayName} topics: status=${statusTopic}, connected=${connectedTopic ?? 'n/a'}, legacy=${this.legacyMode}`,
@@ -74,9 +84,17 @@ export class RollerShutterAccessory {
           }
           return;
         }
-        const value = parseFloat(message.toString());
-        if (!Number.isNaN(value)) {
+        const payload = message.toString();
+        const value = this.parseNumericPayload(
+          payload,
+          ['shut', 'value', 'position', 'percent'],
+        );
+        if (value !== null) {
           this.applyShutUpdate(value);
+        } else {
+          this.platform.log.debug(
+            `RollerShutter ${this.accessory.displayName} ignored payload on ${statusTopic}: ${payload.trim()}`,
+          );
         }
       },
       this.accessory.UUID,
@@ -139,7 +157,7 @@ export class RollerShutterAccessory {
     const isEndpoint = this.targetPosition === 0 || this.targetPosition === 100;
     if ((controlMode === 'set' || controlMode === 'hybrid')
       && !(controlMode === 'hybrid' && isEndpoint)) {
-      const topic = `${this.context.topic}/${this.platform.getCoveringSetTopicSuffix()}`;
+      const topic = `${this.baseTopic}/${this.platform.getCoveringSetTopicSuffix()}`;
       this.platform.log.debug(`Publishing ${topic} = ${shutValue}`);
       this.platform.publishCommand(topic, shutValue, (error) => {
         if (error) {
@@ -148,7 +166,7 @@ export class RollerShutterAccessory {
       });
     }
     if (controlMode === 'execute_action' || controlMode === 'hybrid') {
-      const actionTopic = `${this.context.topic}/execute_action`;
+      const actionTopic = `${this.baseTopic}/execute_action`;
       if (controlMode === 'hybrid' && this.targetPosition !== 0 && this.targetPosition !== 100) {
         return;
       }
@@ -188,7 +206,7 @@ export class RollerShutterAccessory {
       this.service.updateCharacteristic(this.platform.Characteristic.HoldPosition, 0);
       return;
     }
-    const actionTopic = `${this.context.topic}/execute_action`;
+    const actionTopic = `${this.baseTopic}/execute_action`;
     this.platform.log.debug(`Publishing ${actionTopic} = ${stopAction} (hold)`);
     this.platform.publishCommand(actionTopic, stopAction, (error) => {
       if (error) {
@@ -219,6 +237,9 @@ export class RollerShutterAccessory {
     const firstUpdate = !this.hasReceivedPosition;
     if (firstUpdate) {
       this.hasReceivedPosition = true;
+      this.platform.log.debug(
+        `RollerShutter ${this.accessory.displayName} initial position=${this.currentPosition} shut=${shutValue}`,
+      );
     }
     if (positionChanged) {
       this.setJammed(false);
@@ -325,6 +346,41 @@ export class RollerShutterAccessory {
       result.online = this.platform.parseBoolean(record.online);
     }
     return result;
+  }
+
+  private parseNumericPayload(payload: string, fields: string[]): number | null {
+    const trimmed = payload.trim();
+    if (!trimmed) {
+      return null;
+    }
+    const direct = Number(trimmed);
+    if (!Number.isNaN(direct)) {
+      return direct;
+    }
+    try {
+      const parsed = JSON.parse(trimmed) as unknown;
+      if (typeof parsed === 'number') {
+        return parsed;
+      }
+      if (typeof parsed === 'string') {
+        const numeric = Number(parsed);
+        return Number.isNaN(numeric) ? null : numeric;
+      }
+      if (parsed && typeof parsed === 'object') {
+        const record = parsed as Record<string, unknown>;
+        for (const field of fields) {
+          if (Object.prototype.hasOwnProperty.call(record, field)) {
+            const numeric = Number(record[field]);
+            if (!Number.isNaN(numeric)) {
+              return numeric;
+            }
+          }
+        }
+      }
+    } catch {
+      return null;
+    }
+    return null;
   }
 
   private publishLegacyCommand(targetPosition: number) {
@@ -582,7 +638,7 @@ export class RollerShutterAccessory {
       clearTimeout(this.stopTimer);
     }
     this.stopTimer = setTimeout(() => {
-      const actionTopic = `${this.context.topic}/execute_action`;
+      const actionTopic = `${this.baseTopic}/execute_action`;
       this.platform.log.debug(`Publishing ${actionTopic} = ${stopAction} (auto-stop)`);
       this.platform.publishCommand(actionTopic, stopAction, (error) => {
         if (error) {

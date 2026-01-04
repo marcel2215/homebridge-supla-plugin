@@ -173,9 +173,21 @@ export class SuplaPlatform implements DynamicPlatformPlugin {
     this.log.info('Loading accessory from cache:', accessory.displayName);
 
     // add the restored accessory to the accessories cache so we can track if it has already been registered
-    // Force reconfiguration on each launch to rebind handlers/subscriptions.
-    accessory.context.deviceConfigured = false;
     this.accessories.push(accessory);
+
+    const cachedDevice = accessory.context.device as SuplaChannelContext | undefined;
+    if (!cachedDevice || typeof cachedDevice !== 'object') {
+      this.log.warn(
+        `Cached accessory ${accessory.displayName} missing device context; will configure after discovery.`,
+      );
+      accessory.context.deviceConfigured = false;
+      return;
+    }
+    const normalized = this.normalizeChannelContext(cachedDevice);
+    accessory.context.device = normalized;
+    accessory.context.deviceSignature = this.getChannelSignature(normalized);
+    const configured = this.setupAccessory(normalized, accessory);
+    accessory.context.deviceConfigured = configured;
   }
 
   /**
@@ -190,13 +202,30 @@ export class SuplaPlatform implements DynamicPlatformPlugin {
     this.log.debug(
       `Discovery mode: ${channelsOverride ? 'live' : 'cached'} channels`,
     );
-    const channelUuids = new Set(channels.map(channel => this.getChannelUuid(channel)));
+    const channelUuids = new Set<string>();
     const shouldPrune = channelsOverride !== undefined && channels.length > 0;
+    const findExistingByIds = (candidate: SuplaChannelContext) => {
+      if (candidate.deviceId === 'unknown' || candidate.channelId === 'unknown') {
+        return undefined;
+      }
+      return this.accessories.find((accessory) => {
+        const existing = accessory.context.device as SuplaChannelContext | undefined;
+        if (!existing) {
+          return false;
+        }
+        if (existing.deviceId === 'unknown' || existing.channelId === 'unknown') {
+          return false;
+        }
+        return existing.deviceId === candidate.deviceId && existing.channelId === candidate.channelId;
+      });
+    };
 
     // loop over the discovered devices and register each one if it has not already been registered
     for (const channel of channels) {
-      const uuid = this.getChannelUuid(channel);
-      const existingAccessory = this.accessories.find(accessory => accessory.UUID === uuid);
+      const existingByIds = findExistingByIds(channel);
+      const uuid = existingByIds?.UUID ?? this.getChannelUuid(channel);
+      channelUuids.add(uuid);
+      const existingAccessory = existingByIds ?? this.accessories.find(accessory => accessory.UUID === uuid);
 
       if (existingAccessory) {
         this.log.info('Restoring existing accessory from cache:', existingAccessory.displayName);
@@ -293,11 +322,12 @@ export class SuplaPlatform implements DynamicPlatformPlugin {
   }
 
   private normalizeChannelContext(channel: SuplaChannelContext): SuplaChannelContext {
-    const topic = channel.topic ?? '';
+    const rawTopic = (channel.rawTopic ?? channel.topic ?? '').toString();
+    const baseFromTopic = this.normalizeTopicBase(rawTopic || (channel.topic ?? '').toString());
     let deviceId = channel.deviceId;
     let channelId = channel.channelId;
     if (!deviceId || !channelId) {
-      const match = topic.match(/devices\/([0-9]+)\/channels\/([0-9]+)$/);
+      const match = baseFromTopic.match(/\/devices\/(\d+)\/channels\/(\d+)(?:\/|$)/);
       if (match) {
         deviceId = match[1];
         channelId = match[2];
@@ -313,9 +343,9 @@ export class SuplaPlatform implements DynamicPlatformPlugin {
     const channelType = channel.channelType || 'UNKNOWN';
     const channelFunction = channel.channelFunction || 'UNKNOWN';
     const mqttContext = this.config as unknown as SuplaMqttClientContext;
-    const baseTopic = topic || `supla/${mqttContext.username}/devices/${deviceId}/channels/${channelId}`;
+    const baseTopic = baseFromTopic || `supla/${mqttContext.username}/devices/${deviceId}/channels/${channelId}`;
     if (deviceId === 'unknown' || channelId === 'unknown') {
-      this.log.warn(`Channel missing device/channel id for topic ${topic}`);
+      this.log.warn(`Channel missing device/channel id for topic ${rawTopic}`);
     }
     return new SuplaChannelContext(
       baseTopic,
@@ -324,6 +354,7 @@ export class SuplaPlatform implements DynamicPlatformPlugin {
       caption,
       deviceId,
       channelId,
+      rawTopic || undefined,
     );
   }
 
@@ -595,6 +626,18 @@ export class SuplaPlatform implements DynamicPlatformPlugin {
 
   private normalizeTopicSuffix(value: string): string {
     return value.toString().replace(/^\/+/, '');
+  }
+
+  public normalizeTopicBase(topic: string): string {
+    let base = (topic ?? '').toString().trim();
+    if (!base) {
+      return '';
+    }
+    base = base.replace(/\/+$/, '');
+    base = base.replace(/\/state\/[^/]+$/, '');
+    base = base.replace(/\/execute_action(?:\/.*)?$/, '');
+    base = base.replace(/\/set\/.+$/, '');
+    return base.replace(/\/+$/, '');
   }
 
   public registerMqttHandler(
@@ -871,7 +914,13 @@ export class SuplaPlatform implements DynamicPlatformPlugin {
         return;
       }
       if (!this.isSubscriptionGranted(topic, granted)) {
-        this.logSubscriptionIssue(topic, `MQTT subscription denied for ${topic}.`);
+        const grantedSummary = Array.isArray(granted)
+          ? (granted.map((entry) => `${entry.topic}:${entry.qos}`).join(',') || 'none')
+          : 'unknown';
+        this.logSubscriptionIssue(
+          topic,
+          `MQTT subscription denied for ${topic} (granted=${grantedSummary}).`,
+        );
         this.mqttSubscriptions.delete(topic);
         this.scheduleSubscriptionRetry(topic, 'denied', true);
         return;

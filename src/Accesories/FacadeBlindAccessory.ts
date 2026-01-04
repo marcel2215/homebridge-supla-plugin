@@ -11,6 +11,7 @@ export class FacadeBlindAccessory {
   private targetTiltAngle = 0;
   private connected = true;
   private stopTimer?: NodeJS.Timeout;
+  private readonly baseTopic: string;
   private hasReceivedPosition = false;
   private hasReceivedTilt = false;
   private pendingTargetPosition?: number;
@@ -36,31 +37,45 @@ export class FacadeBlindAccessory {
 
     this.service.setCharacteristic(this.platform.Characteristic.Name, accessory.displayName);
 
-    this.service.getCharacteristic(this.platform.Characteristic.CurrentPosition)
-      .onGet(this.handleCurrentPositionGet.bind(this));
-    this.service.getCharacteristic(this.platform.Characteristic.TargetPosition)
-      .setProps({ minValue: 0, maxValue: 100, minStep: 1 })
+    const currentPosition = this.service.getCharacteristic(this.platform.Characteristic.CurrentPosition);
+    currentPosition.removeOnGet();
+    currentPosition.onGet(this.handleCurrentPositionGet.bind(this));
+
+    const targetPosition = this.service.getCharacteristic(this.platform.Characteristic.TargetPosition);
+    targetPosition.removeOnGet();
+    targetPosition.removeOnSet();
+    targetPosition.setProps({ minValue: 0, maxValue: 100, minStep: 1 })
       .onGet(this.handleTargetPositionGet.bind(this))
       .onSet(this.handleTargetPositionSet.bind(this));
-    this.service.getCharacteristic(this.platform.Characteristic.PositionState)
-      .onGet(this.handlePositionStateGet.bind(this));
-    this.service.getCharacteristic(this.platform.Characteristic.CurrentHorizontalTiltAngle)
-      .onGet(this.handleCurrentTiltGet.bind(this));
-    this.service.getCharacteristic(this.platform.Characteristic.TargetHorizontalTiltAngle)
-      .setProps({ minValue: -90, maxValue: 90, minStep: 1 })
+
+    const positionState = this.service.getCharacteristic(this.platform.Characteristic.PositionState);
+    positionState.removeOnGet();
+    positionState.onGet(this.handlePositionStateGet.bind(this));
+
+    const currentTilt = this.service.getCharacteristic(this.platform.Characteristic.CurrentHorizontalTiltAngle);
+    currentTilt.removeOnGet();
+    currentTilt.onGet(this.handleCurrentTiltGet.bind(this));
+
+    const targetTilt = this.service.getCharacteristic(this.platform.Characteristic.TargetHorizontalTiltAngle);
+    targetTilt.removeOnGet();
+    targetTilt.removeOnSet();
+    targetTilt.setProps({ minValue: -90, maxValue: 90, minStep: 1 })
       .onGet(this.handleTargetTiltGet.bind(this))
       .onSet(this.handleTargetTiltSet.bind(this));
-    this.service.getCharacteristic(this.platform.Characteristic.HoldPosition)
-      .onSet(this.handleHoldPositionSet.bind(this));
+
+    const holdPosition = this.service.getCharacteristic(this.platform.Characteristic.HoldPosition);
+    holdPosition.removeOnSet();
+    holdPosition.onSet(this.handleHoldPositionSet.bind(this));
     this.service.setCharacteristic(this.platform.Characteristic.StatusJammed, 0);
 
     this.platform.registerOwnerCleanup(this.accessory.UUID, () => {
       this.disposeTimers();
     });
 
-    const statusTopic = `${this.context.topic}/state/shut`;
-    const tiltTopic = `${this.context.topic}/state/tilt`;
-    const connectedTopic = `${this.context.topic}/state/connected`;
+    this.baseTopic = this.platform.normalizeTopicBase(this.context.topic);
+    const statusTopic = `${this.baseTopic}/state/shut`;
+    const tiltTopic = `${this.baseTopic}/state/tilt`;
+    const connectedTopic = `${this.baseTopic}/state/connected`;
 
     this.platform.log.debug(
       `FacadeBlind ${this.accessory.displayName} topics: status=${statusTopic}, tilt=${tiltTopic}, connected=${connectedTopic}`,
@@ -69,9 +84,17 @@ export class FacadeBlindAccessory {
     this.platform.registerMqttHandler(
       statusTopic,
       (message) => {
-        const value = parseFloat(message.toString());
-        if (!Number.isNaN(value)) {
+        const payload = message.toString();
+        const value = this.parseNumericPayload(
+          payload,
+          ['shut', 'value', 'position', 'percent'],
+        );
+        if (value !== null) {
           this.applyShutUpdate(value);
+        } else {
+          this.platform.log.debug(
+            `FacadeBlind ${this.accessory.displayName} ignored payload on ${statusTopic}: ${payload.trim()}`,
+          );
         }
       },
       this.accessory.UUID,
@@ -79,12 +102,22 @@ export class FacadeBlindAccessory {
     this.platform.registerMqttHandler(
       tiltTopic,
       (message) => {
-        const value = parseFloat(message.toString());
-        if (!Number.isNaN(value)) {
+        const payload = message.toString();
+        const value = this.parseNumericPayload(
+          payload,
+          ['tilt', 'value', 'position', 'angle', 'percent'],
+        );
+        if (value !== null) {
           const previousTilt = this.currentTiltAngle;
           const previousTarget = this.targetTiltAngle;
           this.currentTiltAngle = Math.round(this.toTiltAngle(value));
+          const firstTilt = !this.hasReceivedTilt;
           this.hasReceivedTilt = true;
+          if (firstTilt) {
+            this.platform.log.debug(
+              `FacadeBlind ${this.accessory.displayName} initial tilt=${this.currentTiltAngle} raw=${value}`,
+            );
+          }
           const now = Date.now();
           const targetDelta = Math.abs(this.targetTiltAngle - this.currentTiltAngle);
           const commandStale = this.lastTiltCommandAt === 0 || (now - this.lastTiltCommandAt) > 3000;
@@ -159,7 +192,7 @@ export class FacadeBlindAccessory {
     const isEndpoint = this.targetPosition === 0 || this.targetPosition === 100;
     if ((controlMode === 'set' || controlMode === 'hybrid')
       && !(controlMode === 'hybrid' && isEndpoint)) {
-      const topic = `${this.context.topic}/${this.platform.getCoveringSetTopicSuffix()}`;
+      const topic = `${this.baseTopic}/${this.platform.getCoveringSetTopicSuffix()}`;
       this.platform.log.debug(`Publishing ${topic} = ${shutValue}`);
       this.platform.publishCommand(topic, shutValue, (error) => {
         if (error) {
@@ -168,7 +201,7 @@ export class FacadeBlindAccessory {
       });
     }
     if (controlMode === 'execute_action' || controlMode === 'hybrid') {
-      const actionTopic = `${this.context.topic}/execute_action`;
+      const actionTopic = `${this.baseTopic}/execute_action`;
       if (controlMode === 'hybrid' && this.targetPosition !== 0 && this.targetPosition !== 100) {
         return;
       }
@@ -203,7 +236,7 @@ export class FacadeBlindAccessory {
       this.service.updateCharacteristic(this.platform.Characteristic.HoldPosition, 0);
       return;
     }
-    const actionTopic = `${this.context.topic}/execute_action`;
+    const actionTopic = `${this.baseTopic}/execute_action`;
     this.platform.log.debug(`Publishing ${actionTopic} = ${stopAction} (hold)`);
     this.platform.publishCommand(actionTopic, stopAction, (error) => {
       if (error) {
@@ -234,6 +267,9 @@ export class FacadeBlindAccessory {
     const firstUpdate = !this.hasReceivedPosition;
     if (firstUpdate) {
       this.hasReceivedPosition = true;
+      this.platform.log.debug(
+        `FacadeBlind ${this.accessory.displayName} initial position=${this.currentPosition} shut=${shutValue}`,
+      );
     }
     if (positionChanged) {
       this.setJammed(false);
@@ -359,6 +395,41 @@ export class FacadeBlindAccessory {
         `No progress for ${this.accessory.displayName} within ${timeoutMs}ms; forcing STOPPED.`,
       );
     }, timeoutMs);
+  }
+
+  private parseNumericPayload(payload: string, fields: string[]): number | null {
+    const trimmed = payload.trim();
+    if (!trimmed) {
+      return null;
+    }
+    const direct = Number(trimmed);
+    if (!Number.isNaN(direct)) {
+      return direct;
+    }
+    try {
+      const parsed = JSON.parse(trimmed) as unknown;
+      if (typeof parsed === 'number') {
+        return parsed;
+      }
+      if (typeof parsed === 'string') {
+        const numeric = Number(parsed);
+        return Number.isNaN(numeric) ? null : numeric;
+      }
+      if (parsed && typeof parsed === 'object') {
+        const record = parsed as Record<string, unknown>;
+        for (const field of fields) {
+          if (Object.prototype.hasOwnProperty.call(record, field)) {
+            const numeric = Number(record[field]);
+            if (!Number.isNaN(numeric)) {
+              return numeric;
+            }
+          }
+        }
+      }
+    } catch {
+      return null;
+    }
+    return null;
   }
 
   private clearPendingNoProgressTimeout() {
@@ -495,7 +566,7 @@ export class FacadeBlindAccessory {
       this.targetTiltAngle,
     );
     const tiltValue = this.toTiltValue(this.targetTiltAngle).toString();
-    const tiltTopic = `${this.context.topic}/${this.platform.getCoveringTiltTopicSuffix()}`;
+    const tiltTopic = `${this.baseTopic}/${this.platform.getCoveringTiltTopicSuffix()}`;
     this.platform.log.debug(`Publishing ${tiltTopic} = ${tiltValue}`);
     this.platform.publishCommand(tiltTopic, tiltValue, (error) => {
       if (error) {
@@ -567,7 +638,7 @@ export class FacadeBlindAccessory {
       clearTimeout(this.stopTimer);
     }
     this.stopTimer = setTimeout(() => {
-      const actionTopic = `${this.context.topic}/execute_action`;
+      const actionTopic = `${this.baseTopic}/execute_action`;
       this.platform.log.debug(`Publishing ${actionTopic} = ${stopAction} (auto-stop)`);
       this.platform.publishCommand(actionTopic, stopAction, (error) => {
         if (error) {
