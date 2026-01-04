@@ -14,6 +14,8 @@ export class RollerShutterAccessory {
   private pendingTargetPosition?: number;
   private pendingTargetExpiresAt = 0;
   private pendingTargetTimer?: NodeJS.Timeout;
+  private pendingNoProgressTimer?: NodeJS.Timeout;
+  private pendingLastDistance?: number;
   private motionStopTimer?: NodeJS.Timeout;
   private jammed = false;
 
@@ -122,6 +124,8 @@ export class RollerShutterAccessory {
     }
     if (this.targetPosition !== this.currentPosition) {
       this.pendingTargetPosition = this.targetPosition;
+      this.pendingLastDistance = Math.abs(this.pendingTargetPosition - this.currentPosition);
+      this.schedulePendingNoProgressTimeout();
       this.schedulePendingTimeout(this.targetPosition, this.currentPosition);
     } else {
       this.clearPendingTarget(false);
@@ -231,7 +235,13 @@ export class RollerShutterAccessory {
           this.setJammed(true);
         }
       } else {
-        if (positionChanged || firstUpdate) {
+        const distance = Math.abs(this.pendingTargetPosition - this.currentPosition);
+        const progressed = this.pendingLastDistance === undefined || distance < this.pendingLastDistance;
+        if (progressed) {
+          this.pendingLastDistance = distance;
+          this.schedulePendingNoProgressTimeout();
+        }
+        if (progressed && (positionChanged || firstUpdate)) {
           this.schedulePendingTimeout(this.pendingTargetPosition, this.currentPosition);
         }
         if (this.pendingTargetPosition > this.currentPosition) {
@@ -399,13 +409,54 @@ export class RollerShutterAccessory {
     }, timeoutMs);
   }
 
+  private schedulePendingNoProgressTimeout() {
+    const travelTimeSeconds = this.platform.getCoveringTravelTimeSeconds();
+    let timeoutMs = 10000;
+    if (travelTimeSeconds > 0) {
+      const computed = Math.round(travelTimeSeconds * 250);
+      timeoutMs = Math.min(15000, Math.max(5000, computed));
+    }
+    if (timeoutMs <= 0) {
+      return;
+    }
+    if (this.pendingNoProgressTimer) {
+      clearTimeout(this.pendingNoProgressTimer);
+    }
+    this.pendingNoProgressTimer = setTimeout(() => {
+      this.pendingNoProgressTimer = undefined;
+      if (this.pendingTargetPosition === undefined) {
+        return;
+      }
+      this.setJammed(true);
+      this.clearPendingTarget(true);
+      this.clearStopTimer();
+      this.clearMotionStopTimer();
+      if (this.positionState !== this.platform.Characteristic.PositionState.STOPPED) {
+        this.positionState = this.platform.Characteristic.PositionState.STOPPED;
+        this.service.updateCharacteristic(this.platform.Characteristic.PositionState, this.positionState);
+      }
+      this.platform.log.debug(
+        `No progress for ${this.accessory.displayName} within ${timeoutMs}ms; forcing STOPPED.`,
+      );
+    }, timeoutMs);
+  }
+
+  private clearPendingNoProgressTimeout() {
+    if (this.pendingNoProgressTimer) {
+      clearTimeout(this.pendingNoProgressTimer);
+      this.pendingNoProgressTimer = undefined;
+    }
+  }
+
   private clearPendingTarget(syncTarget: boolean) {
     if (this.pendingTargetTimer) {
       clearTimeout(this.pendingTargetTimer);
       this.pendingTargetTimer = undefined;
     }
+    this.clearPendingNoProgressTimeout();
     this.pendingTargetPosition = undefined;
     this.pendingTargetExpiresAt = 0;
+    this.pendingLastDistance = undefined;
     if (syncTarget && this.targetPosition !== this.currentPosition) {
       this.targetPosition = this.currentPosition;
       this.service.updateCharacteristic(this.platform.Characteristic.TargetPosition, this.targetPosition);
