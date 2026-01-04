@@ -113,6 +113,11 @@ export class GateAccessory {
     const isMoving = this.currentState === this.platform.Characteristic.CurrentDoorState.OPENING
       || this.currentState === this.platform.Characteristic.CurrentDoorState.CLOSING;
     let target = requestedTarget;
+    if (!isMoving
+      && requestedTarget === this.platform.Characteristic.TargetDoorState.OPEN
+      && this.isKnownNotClosed()) {
+      target = this.platform.Characteristic.TargetDoorState.CLOSED;
+    }
     // HomeKit can resend the same target while moving; treat it as a reverse for toggle gates.
     if (mode === 'toggle' && isMoving && motionTarget !== undefined && requestedTarget === motionTarget) {
       target = requestedTarget === this.platform.Characteristic.TargetDoorState.OPEN
@@ -317,12 +322,24 @@ export class GateAccessory {
     if (this.pendingTarget !== undefined) {
       return;
     }
-    const knowsNotClosed = (this.hasClosedSensorState && !this.isClosedSensorActive)
-      || (this.hasPartialSensorState && this.isPartialSensorActive);
-    if (!knowsNotClosed) {
+    if (!this.isKnownNotClosed()) {
       return;
     }
     this.setTargetState(this.platform.Characteristic.TargetDoorState.OPEN);
+  }
+
+  private isKnownNotClosed(): boolean {
+    if (this.hasClosedSensorState) {
+      return !this.isClosedSensorActive;
+    }
+    if (this.hasPartialSensorState && this.isPartialSensorActive) {
+      return true;
+    }
+    if (this.currentState === this.platform.Characteristic.CurrentDoorState.OPEN) {
+      return true;
+    }
+    return this.currentState === this.platform.Characteristic.CurrentDoorState.STOPPED
+      && this.targetState === this.platform.Characteristic.TargetDoorState.OPEN;
   }
 
   private updateStatusFault() {
