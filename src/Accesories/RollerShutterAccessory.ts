@@ -15,7 +15,6 @@ export class RollerShutterAccessory {
   private pendingTargetExpiresAt = 0;
   private pendingTargetTimer?: NodeJS.Timeout;
   private motionStopTimer?: NodeJS.Timeout;
-  private lastRawPosition?: number;
   private jammed = false;
 
   constructor(
@@ -55,6 +54,10 @@ export class RollerShutterAccessory {
     const connectedTopic = this.legacyMode
       ? undefined
       : `${this.context.topic}/state/connected`;
+
+    this.platform.log.debug(
+      `RollerShutter ${this.accessory.displayName} topics: status=${statusTopic}, connected=${connectedTopic ?? 'n/a'}, legacy=${this.legacyMode}`,
+    );
 
     this.platform.registerMqttHandler(
       statusTopic,
@@ -102,6 +105,7 @@ export class RollerShutterAccessory {
     this.setJammed(false);
     this.clearMotionStopTimer();
     this.targetPosition = Math.round(this.clamp(target, 0, 100));
+    const commandTarget = this.targetPosition;
     if (this.targetPosition > this.currentPosition) {
       this.positionState = this.platform.Characteristic.PositionState.INCREASING;
     } else if (this.targetPosition < this.currentPosition) {
@@ -135,7 +139,7 @@ export class RollerShutterAccessory {
       this.platform.log.debug(`Publishing ${topic} = ${shutValue}`);
       this.platform.publishCommand(topic, shutValue, (error) => {
         if (error) {
-          this.platform.log.error(`Publish failed for ${topic}: ${error.message}`);
+          this.handleCommandPublishError(commandTarget, topic, error);
         }
       });
     }
@@ -149,7 +153,7 @@ export class RollerShutterAccessory {
         this.platform.log.debug(`Publishing ${actionTopic} = ${action}`);
         this.platform.publishCommand(actionTopic, action, (error) => {
           if (error) {
-            this.platform.log.error(`Publish failed for ${actionTopic}: ${error.message}`);
+            this.handleCommandPublishError(commandTarget, actionTopic, error);
           }
         });
       }
@@ -202,19 +206,17 @@ export class RollerShutterAccessory {
     const previousTarget = this.targetPosition;
     const previousState = this.positionState;
     const rawPosition = this.toPosition(shutValue);
-    const previousRaw = this.lastRawPosition ?? rawPosition;
-    const rawDelta = rawPosition - previousRaw;
-    const rawMovement = Math.abs(rawDelta) >= 0.05;
-    this.lastRawPosition = rawPosition;
     const previousPosition = this.currentPosition;
     this.currentPosition = Math.round(rawPosition);
+    const positionDelta = this.currentPosition - previousPosition;
+    const positionChanged = positionDelta !== 0;
     let nextPositionState = this.platform.Characteristic.PositionState.STOPPED;
     const now = Date.now();
     const firstUpdate = !this.hasReceivedPosition;
     if (firstUpdate) {
       this.hasReceivedPosition = true;
     }
-    if (rawMovement || this.currentPosition !== previousPosition) {
+    if (positionChanged) {
       this.setJammed(false);
     }
     if (this.pendingTargetPosition !== undefined) {
@@ -229,7 +231,7 @@ export class RollerShutterAccessory {
           this.setJammed(true);
         }
       } else {
-        if (rawMovement || firstUpdate) {
+        if (positionChanged || firstUpdate) {
           this.schedulePendingTimeout(this.pendingTargetPosition, this.currentPosition);
         }
         if (this.pendingTargetPosition > this.currentPosition) {
@@ -242,8 +244,8 @@ export class RollerShutterAccessory {
       this.clearPendingTarget(false);
       this.clearStopTimer();
       this.targetPosition = this.currentPosition;
-      if (rawMovement) {
-        nextPositionState = rawDelta > 0
+      if (positionChanged) {
+        nextPositionState = positionDelta > 0
           ? this.platform.Characteristic.PositionState.INCREASING
           : this.platform.Characteristic.PositionState.DECREASING;
         this.scheduleMotionStopTimer();
@@ -281,7 +283,6 @@ export class RollerShutterAccessory {
     if (!this.connected) {
       this.setJammed(false);
       this.hasReceivedPosition = false;
-      this.lastRawPosition = undefined;
       this.clearPendingTarget(true);
       this.clearStopTimer();
       this.clearMotionStopTimer();
@@ -328,7 +329,7 @@ export class RollerShutterAccessory {
     this.platform.log.debug(`Publishing ${topic} = ${payload}`);
     this.platform.publishCommand(topic, payload, (error) => {
       if (error) {
-        this.platform.log.error(`Publish failed for ${topic}: ${error.message}`);
+        this.handleCommandPublishError(targetPosition, topic, error);
       }
     });
   }
@@ -428,6 +429,10 @@ export class RollerShutterAccessory {
       if (this.pendingTargetPosition !== undefined) {
         return;
       }
+      if (this.targetPosition !== this.currentPosition) {
+        this.targetPosition = this.currentPosition;
+        this.service.updateCharacteristic(this.platform.Characteristic.TargetPosition, this.targetPosition);
+      }
       if (this.positionState !== this.platform.Characteristic.PositionState.STOPPED) {
         this.positionState = this.platform.Characteristic.PositionState.STOPPED;
         this.service.updateCharacteristic(this.platform.Characteristic.PositionState, this.positionState);
@@ -457,6 +462,21 @@ export class RollerShutterAccessory {
       this.platform.Characteristic.StatusJammed,
       this.jammed ? 1 : 0,
     );
+  }
+
+  private handleCommandPublishError(target: number, topic: string, error: Error) {
+    this.platform.log.error(`Publish failed for ${topic}: ${error.message}`);
+    if (this.pendingTargetPosition !== target) {
+      return;
+    }
+    this.setJammed(true);
+    this.clearPendingTarget(true);
+    this.clearStopTimer();
+    this.clearMotionStopTimer();
+    if (this.positionState !== this.platform.Characteristic.PositionState.STOPPED) {
+      this.positionState = this.platform.Characteristic.PositionState.STOPPED;
+      this.service.updateCharacteristic(this.platform.Characteristic.PositionState, this.positionState);
+    }
   }
 
   async handlePositionStateGet(): Promise<CharacteristicValue> {
