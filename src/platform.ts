@@ -173,6 +173,8 @@ export class SuplaPlatform implements DynamicPlatformPlugin {
     this.log.info('Loading accessory from cache:', accessory.displayName);
 
     // add the restored accessory to the accessories cache so we can track if it has already been registered
+    // Force reconfiguration on each launch to rebind handlers/subscriptions.
+    accessory.context.deviceConfigured = false;
     this.accessories.push(accessory);
   }
 
