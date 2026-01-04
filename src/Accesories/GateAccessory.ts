@@ -19,6 +19,9 @@ export class GateAccessory {
   private transitionTimer?: NodeJS.Timeout;
   private readonly transitionTimeoutMs = 60000;
   private readonly partialHiMode: PartialHiMode;
+  private readonly baseTopic: string;
+  private reverseToggleTimer?: NodeJS.Timeout;
+  private readonly reverseToggleDelayMs = 350;
 
   constructor(
     private readonly platform: SuplaPlatform,
@@ -51,12 +54,14 @@ export class GateAccessory {
 
     this.platform.registerOwnerCleanup(this.accessory.UUID, () => {
       this.clearTransitionTimer();
+      this.clearReverseToggleTimer();
     });
 
     this.partialHiMode = this.platform.getGatePartialHiMode();
+    this.baseTopic = this.platform.normalizeTopicBase(this.context.topic);
 
     this.platform.registerMqttHandler(
-      `${this.context.topic}/state/hi`,
+      `${this.baseTopic}/state/hi`,
       (message) => {
         const next = this.platform.parseBoolean(message.toString());
         const changed = !this.hasClosedSensorState || next !== this.isClosedSensorActive;
@@ -67,7 +72,7 @@ export class GateAccessory {
       this.accessory.UUID,
     );
     this.platform.registerMqttHandler(
-      `${this.context.topic}/state/partial_hi`,
+      `${this.baseTopic}/state/partial_hi`,
       (message) => {
         const next = this.platform.parseBoolean(message.toString());
         const changed = !this.hasPartialSensorState || next !== this.isPartialSensorActive;
@@ -78,7 +83,7 @@ export class GateAccessory {
       this.accessory.UUID,
     );
     this.platform.registerMqttHandler(
-      `${this.context.topic}/state/connected`,
+      `${this.baseTopic}/state/connected`,
       (message) => {
         this.connected = this.platform.parseBoolean(message.toString());
         this.updateStatusFault();
@@ -105,6 +110,7 @@ export class GateAccessory {
     const target = value as number;
     const previousTarget = this.targetState;
     this.setTargetState(target);
+    this.clearReverseToggleTimer();
 
     if (!this.connected) {
       this.platform.log.warn(`Gate ${this.accessory.displayName} is offline; ignoring command.`);
@@ -135,11 +141,12 @@ export class GateAccessory {
       this.setTargetState(previousTarget);
       return;
     }
-    this.platform.log.debug(`Publishing ${this.context.topic}/execute_action = ${action}`);
-    this.platform.publishCommand(
-      `${this.context.topic}/execute_action`,
-      action,
-    );
+    const motionTarget = this.getMotionTarget();
+    const isReversing = motionTarget !== undefined && motionTarget !== target;
+    this.publishGateAction(action, isReversing && mode === 'toggle' ? 'reverse' : undefined);
+    if (mode === 'toggle' && isReversing) {
+      this.scheduleReverseToggle(action, target);
+    }
 
     this.clearFaults();
     this.pendingTarget = target;
@@ -166,6 +173,7 @@ export class GateAccessory {
       }
       this.pendingTarget = undefined;
       this.clearTransitionTimer();
+      this.clearReverseToggleTimer();
       this.applyDoorState(
         this.platform.Characteristic.CurrentDoorState.CLOSED,
         this.platform.Characteristic.TargetDoorState.CLOSED,
@@ -178,12 +186,7 @@ export class GateAccessory {
         this.setCurrentState(this.resolveMovingState());
         return;
       }
-      this.pendingTarget = undefined;
-      this.clearTransitionTimer();
-      this.applyDoorState(
-        this.platform.Characteristic.CurrentDoorState.OPEN,
-        this.platform.Characteristic.TargetDoorState.OPEN,
-      );
+      this.setCurrentState(this.platform.Characteristic.CurrentDoorState.STOPPED);
       return;
     }
 
@@ -191,6 +194,7 @@ export class GateAccessory {
       if (this.isPartialSensorActive) {
         this.pendingTarget = undefined;
         this.clearTransitionTimer();
+        this.clearReverseToggleTimer();
         this.applyDoorState(
           this.platform.Characteristic.CurrentDoorState.OPEN,
           this.platform.Characteristic.TargetDoorState.OPEN,
@@ -209,6 +213,7 @@ export class GateAccessory {
       if (this.isPartialSensorActive) {
         this.pendingTarget = undefined;
         this.clearTransitionTimer();
+        this.clearReverseToggleTimer();
         this.setCurrentState(this.platform.Characteristic.CurrentDoorState.STOPPED);
         return;
       }
@@ -218,6 +223,7 @@ export class GateAccessory {
       }
       this.pendingTarget = undefined;
       this.clearTransitionTimer();
+      this.clearReverseToggleTimer();
       this.applyDoorState(
         this.platform.Characteristic.CurrentDoorState.OPEN,
         this.platform.Characteristic.TargetDoorState.OPEN,
@@ -227,6 +233,7 @@ export class GateAccessory {
 
     this.pendingTarget = undefined;
     this.clearTransitionTimer();
+    this.clearReverseToggleTimer();
     this.applyDoorState(
       this.platform.Characteristic.CurrentDoorState.OPEN,
       this.platform.Characteristic.TargetDoorState.OPEN,
@@ -241,13 +248,16 @@ export class GateAccessory {
       return this.isClosedSensorActive;
     }
     if (target === this.platform.Characteristic.TargetDoorState.OPEN) {
+      if (this.partialHiMode === 'moving') {
+        return false;
+      }
       if (this.partialHiMode === 'open_endstop') {
         if (!this.hasPartialSensorState) {
           return false;
         }
         return this.isPartialSensorActive;
       }
-      if (this.partialHiMode === 'moving' || this.partialHiMode === 'pedestrian_endstop') {
+      if (this.partialHiMode === 'pedestrian_endstop') {
         if (!this.hasClosedSensorState && !this.hasPartialSensorState) {
           return false;
         }
@@ -332,6 +342,13 @@ export class GateAccessory {
     }
   }
 
+  private clearReverseToggleTimer() {
+    if (this.reverseToggleTimer) {
+      clearTimeout(this.reverseToggleTimer);
+      this.reverseToggleTimer = undefined;
+    }
+  }
+
   private touchTransitionTimer() {
     if (this.pendingTarget === undefined) {
       return;
@@ -347,5 +364,41 @@ export class GateAccessory {
       return this.platform.Characteristic.CurrentDoorState.CLOSING;
     }
     return this.platform.Characteristic.CurrentDoorState.STOPPED;
+  }
+
+  private getMotionTarget(): number | undefined {
+    if (this.pendingTarget !== undefined) {
+      return this.pendingTarget;
+    }
+    if (this.currentState === this.platform.Characteristic.CurrentDoorState.OPENING) {
+      return this.platform.Characteristic.TargetDoorState.OPEN;
+    }
+    if (this.currentState === this.platform.Characteristic.CurrentDoorState.CLOSING) {
+      return this.platform.Characteristic.TargetDoorState.CLOSED;
+    }
+    return undefined;
+  }
+
+  private publishGateAction(action: string, note?: string) {
+    const suffix = note ? ` (${note})` : '';
+    this.platform.log.debug(`Publishing ${this.baseTopic}/execute_action = ${action}${suffix}`);
+    this.platform.publishCommand(
+      `${this.baseTopic}/execute_action`,
+      action,
+    );
+  }
+
+  private scheduleReverseToggle(action: string, expectedTarget: number) {
+    this.clearReverseToggleTimer();
+    this.reverseToggleTimer = setTimeout(() => {
+      this.reverseToggleTimer = undefined;
+      if (!this.connected) {
+        return;
+      }
+      if (this.pendingTarget !== expectedTarget) {
+        return;
+      }
+      this.publishGateAction(action, 'reverse-2');
+    }, this.reverseToggleDelayMs);
   }
 }
