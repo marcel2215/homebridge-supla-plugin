@@ -193,9 +193,11 @@ export class GateAccessory {
     if (this.partialHiMode === 'moving') {
       if (this.isPartialSensorActive) {
         this.setCurrentState(this.resolveMovingState());
+        this.maybeSetIdleOpenTarget();
         return;
       }
       this.setCurrentState(this.platform.Characteristic.CurrentDoorState.STOPPED);
+      this.maybeSetIdleOpenTarget();
       return;
     }
 
@@ -215,6 +217,7 @@ export class GateAccessory {
         return;
       }
       this.setCurrentState(this.platform.Characteristic.CurrentDoorState.STOPPED);
+      this.maybeSetIdleOpenTarget();
       return;
     }
 
@@ -224,6 +227,7 @@ export class GateAccessory {
         this.clearTransitionTimer();
         this.clearReverseToggleTimer();
         this.setCurrentState(this.platform.Characteristic.CurrentDoorState.STOPPED);
+        this.maybeSetIdleOpenTarget();
         return;
       }
       if (this.pendingTarget !== undefined) {
@@ -247,6 +251,7 @@ export class GateAccessory {
     this.clearTransitionTimer();
     this.clearReverseToggleTimer();
     this.setCurrentState(this.platform.Characteristic.CurrentDoorState.STOPPED);
+    this.maybeSetIdleOpenTarget();
   }
 
   private isAtTarget(target: number): boolean {
@@ -306,6 +311,18 @@ export class GateAccessory {
     }
     this.targetState = next;
     this.service.updateCharacteristic(this.platform.Characteristic.TargetDoorState, this.targetState);
+  }
+
+  private maybeSetIdleOpenTarget() {
+    if (this.pendingTarget !== undefined) {
+      return;
+    }
+    const knowsNotClosed = (this.hasClosedSensorState && !this.isClosedSensorActive)
+      || (this.hasPartialSensorState && this.isPartialSensorActive);
+    if (!knowsNotClosed) {
+      return;
+    }
+    this.setTargetState(this.platform.Characteristic.TargetDoorState.OPEN);
   }
 
   private updateStatusFault() {
