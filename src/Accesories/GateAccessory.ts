@@ -162,9 +162,9 @@ export class GateAccessory {
       return;
     }
     const isReversing = motionTarget !== undefined && motionTarget !== target;
-    this.publishGateAction(action, isReversing && mode === 'toggle' ? 'reverse' : undefined);
-    if (mode === 'toggle' && isReversing) {
-      this.scheduleReverseToggle(action, target);
+    this.publishGateAction(action, isReversing ? 'reverse' : undefined);
+    if (isReversing && this.shouldScheduleReverseFollowUp(mode)) {
+      this.scheduleReverseToggle(action, target, mode);
     }
 
     this.clearFaults();
@@ -483,7 +483,11 @@ export class GateAccessory {
     );
   }
 
-  private scheduleReverseToggle(action: string, expectedTarget: number) {
+  private scheduleReverseToggle(
+    action: string,
+    expectedTarget: number,
+    mode: 'execute_action' | 'toggle',
+  ) {
     this.clearReverseToggleTimer();
     this.reverseToggleTimer = setTimeout(() => {
       this.reverseToggleTimer = undefined;
@@ -493,7 +497,33 @@ export class GateAccessory {
       if (this.pendingTarget !== expectedTarget) {
         return;
       }
+      if (mode === 'execute_action' && !this.shouldPublishExecuteActionReverseFollowUp()) {
+        return;
+      }
       this.publishGateAction(action, 'reverse-2');
     }, this.reverseToggleDelayMs);
+  }
+
+  private shouldScheduleReverseFollowUp(mode: 'execute_action' | 'toggle'): boolean {
+    if (mode === 'toggle') {
+      return true;
+    }
+    return this.isOpenCloseExecuteActionPair();
+  }
+
+  private isOpenCloseExecuteActionPair(): boolean {
+    const normalize = (value: string): string => value.trim().toLowerCase();
+    return normalize(this.platform.getGateExecuteActionOpen()) === 'open'
+      && normalize(this.platform.getGateExecuteActionClose()) === 'close';
+  }
+
+  private shouldPublishExecuteActionReverseFollowUp(): boolean {
+    if (this.partialHiMode !== 'moving') {
+      return true;
+    }
+    if (!this.hasPartialSensorState) {
+      return true;
+    }
+    return !this.isPartialSensorActive;
   }
 }
