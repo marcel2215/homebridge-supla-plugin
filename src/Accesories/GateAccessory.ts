@@ -3,6 +3,10 @@ import { SuplaPlatform } from '../platform';
 import { SuplaChannelContext } from '../Heplers/SuplaChannelContext';
 
 type PartialHiMode = 'moving' | 'open_endstop' | 'pedestrian_endstop' | 'ignore';
+type SensorUpdateContext = {
+  closedPrevious?: boolean;
+  partialPrevious?: boolean;
+};
 
 export class GateAccessory {
   private service: Service;
@@ -27,6 +31,8 @@ export class GateAccessory {
   private lastCommandAt = 0;
   private readonly duplicateSetWindowMs = 350;
   private sawPartialMotionDuringPending = false;
+  private lastClosedReleaseAt = 0;
+  private readonly externalDirectionHintWindowMs = 2500;
 
   constructor(
     private readonly platform: SuplaPlatform,
@@ -69,25 +75,39 @@ export class GateAccessory {
     this.platform.registerMqttHandler(
       `${this.baseTopic}/state/hi`,
       (message) => {
+        const previous = this.hasClosedSensorState ? this.isClosedSensorActive : undefined;
         const next = this.platform.parseBoolean(message.toString());
         const changed = !this.hasClosedSensorState || next !== this.isClosedSensorActive;
+        if (previous === true && next === false) {
+          this.lastClosedReleaseAt = Date.now();
+        } else if (next) {
+          this.lastClosedReleaseAt = 0;
+        }
         this.isClosedSensorActive = next;
         this.hasClosedSensorState = true;
-        this.updateStatesFromSensors(changed);
+        this.updateStatesFromSensors({
+          closedPrevious: changed ? previous : undefined,
+        });
       },
       this.accessory.UUID,
     );
     this.platform.registerMqttHandler(
       `${this.baseTopic}/state/partial_hi`,
       (message) => {
+        const previous = this.hasPartialSensorState ? this.isPartialSensorActive : undefined;
         const next = this.platform.parseBoolean(message.toString());
         const changed = !this.hasPartialSensorState || next !== this.isPartialSensorActive;
+        if (previous === true && next === false) {
+          this.lastClosedReleaseAt = 0;
+        }
         this.isPartialSensorActive = next;
         this.hasPartialSensorState = true;
         if (this.pendingTarget !== undefined && this.isPartialSensorActive) {
           this.sawPartialMotionDuringPending = true;
         }
-        this.updateStatesFromSensors(changed);
+        this.updateStatesFromSensors({
+          partialPrevious: changed ? previous : undefined,
+        });
       },
       this.accessory.UUID,
     );
@@ -178,7 +198,11 @@ export class GateAccessory {
     return this.obstructionDetected;
   }
 
-  private updateStatesFromSensors(changed: boolean) {
+  private updateStatesFromSensors(context: SensorUpdateContext) {
+    const changed = (
+      (context.closedPrevious !== undefined && context.closedPrevious !== this.isClosedSensorActive)
+      || (context.partialPrevious !== undefined && context.partialPrevious !== this.isPartialSensorActive)
+    );
     this.clearFaults();
     if (changed) {
       this.touchTransitionTimer();
@@ -222,6 +246,15 @@ export class GateAccessory {
     if (this.pendingTarget !== undefined) {
       this.setTargetState(this.pendingTarget);
       this.setCurrentState(this.resolveMovingState(this.pendingTarget));
+      return;
+    }
+
+    const inferredExternalMotionTarget = this.resolveExternalMotionTarget(context);
+    if (inferredExternalMotionTarget !== undefined) {
+      this.clearTransitionTimer();
+      this.clearOpenArrivalDebounceTimer();
+      this.setTargetState(inferredExternalMotionTarget);
+      this.setCurrentState(this.resolveMovingState(inferredExternalMotionTarget));
       return;
     }
 
@@ -525,5 +558,50 @@ export class GateAccessory {
       return true;
     }
     return !this.isPartialSensorActive;
+  }
+
+  private resolveExternalMotionTarget(context: SensorUpdateContext): number | undefined {
+    if (this.partialHiMode !== 'moving') {
+      return undefined;
+    }
+    if (!this.hasPartialSensorState || !this.isPartialSensorActive) {
+      return undefined;
+    }
+    if (this.hasClosedSensorState && this.isClosedSensorActive) {
+      return undefined;
+    }
+
+    const closedJustOpened = context.closedPrevious !== undefined
+      && context.closedPrevious
+      && !this.isClosedSensorActive;
+    if (closedJustOpened) {
+      return this.platform.Characteristic.TargetDoorState.OPEN;
+    }
+    if (this.wasClosedReleasedRecently()) {
+      return this.platform.Characteristic.TargetDoorState.OPEN;
+    }
+
+    const existingMotionTarget = this.getMotionTarget();
+    if (existingMotionTarget !== undefined) {
+      return existingMotionTarget;
+    }
+
+    if (this.currentState === this.platform.Characteristic.CurrentDoorState.CLOSED) {
+      return this.platform.Characteristic.TargetDoorState.OPEN;
+    }
+    if (this.currentState === this.platform.Characteristic.CurrentDoorState.OPEN) {
+      return this.platform.Characteristic.TargetDoorState.CLOSED;
+    }
+
+    return this.targetState === this.platform.Characteristic.TargetDoorState.OPEN
+      ? this.platform.Characteristic.TargetDoorState.CLOSED
+      : this.platform.Characteristic.TargetDoorState.OPEN;
+  }
+
+  private wasClosedReleasedRecently(): boolean {
+    if (!this.lastClosedReleaseAt) {
+      return false;
+    }
+    return Date.now() - this.lastClosedReleaseAt <= this.externalDirectionHintWindowMs;
   }
 }
