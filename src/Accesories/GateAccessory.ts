@@ -9,7 +9,6 @@ export class GateAccessory {
   private currentState = this.platform.Characteristic.CurrentDoorState.CLOSED;
   private targetState = this.platform.Characteristic.TargetDoorState.CLOSED;
   private connected = true;
-  private hasFault = false;
   private obstructionDetected = false;
   private isClosedSensorActive = false;
   private isPartialSensorActive = false;
@@ -22,6 +21,12 @@ export class GateAccessory {
   private readonly baseTopic: string;
   private reverseToggleTimer?: NodeJS.Timeout;
   private readonly reverseToggleDelayMs = 1200;
+  private openArrivalDebounceTimer?: NodeJS.Timeout;
+  private readonly openArrivalDebounceMs = 450;
+  private lastCommandTarget?: number;
+  private lastCommandAt = 0;
+  private readonly duplicateSetWindowMs = 350;
+  private sawPartialMotionDuringPending = false;
 
   constructor(
     private readonly platform: SuplaPlatform,
@@ -55,6 +60,7 @@ export class GateAccessory {
     this.platform.registerOwnerCleanup(this.accessory.UUID, () => {
       this.clearTransitionTimer();
       this.clearReverseToggleTimer();
+      this.clearOpenArrivalDebounceTimer();
     });
 
     this.partialHiMode = this.platform.getGatePartialHiMode();
@@ -78,6 +84,9 @@ export class GateAccessory {
         const changed = !this.hasPartialSensorState || next !== this.isPartialSensorActive;
         this.isPartialSensorActive = next;
         this.hasPartialSensorState = true;
+        if (this.pendingTarget !== undefined && this.isPartialSensorActive) {
+          this.sawPartialMotionDuringPending = true;
+        }
         this.updateStatesFromSensors(changed);
       },
       this.accessory.UUID,
@@ -88,8 +97,10 @@ export class GateAccessory {
         this.connected = this.platform.parseBoolean(message.toString());
         this.updateStatusFault();
         if (!this.connected) {
-          this.pendingTarget = undefined;
+          this.setPendingTarget(undefined);
           this.clearTransitionTimer();
+          this.clearReverseToggleTimer();
+          this.clearOpenArrivalDebounceTimer();
         }
       },
       this.accessory.UUID,
@@ -110,19 +121,13 @@ export class GateAccessory {
     const requestedTarget = value as number;
     const mode = this.platform.getGateControlMode();
     const motionTarget = this.getMotionTarget();
-    const isMoving = this.currentState === this.platform.Characteristic.CurrentDoorState.OPENING
-      || this.currentState === this.platform.Characteristic.CurrentDoorState.CLOSING;
+    const isMoving = motionTarget !== undefined;
     let target = requestedTarget;
-    if (!isMoving
-      && requestedTarget === this.platform.Characteristic.TargetDoorState.OPEN
-      && this.isKnownNotClosed()) {
-      target = this.platform.Characteristic.TargetDoorState.CLOSED;
-    }
-    // HomeKit can resend the same target while moving; treat it as a reverse for toggle gates.
-    if (mode === 'toggle' && isMoving && motionTarget !== undefined && requestedTarget === motionTarget) {
-      target = requestedTarget === this.platform.Characteristic.TargetDoorState.OPEN
-        ? this.platform.Characteristic.TargetDoorState.CLOSED
-        : this.platform.Characteristic.TargetDoorState.OPEN;
+    if (isMoving && motionTarget !== undefined && requestedTarget === motionTarget) {
+      if (this.isLikelyDuplicateSet(requestedTarget)) {
+        return;
+      }
+      target = this.oppositeTarget(requestedTarget);
     }
     const previousTarget = this.targetState;
     this.setTargetState(target);
@@ -135,7 +140,7 @@ export class GateAccessory {
       return;
     }
 
-    if (mode === 'toggle' && this.isAtTarget(target)) {
+    if (!isMoving && this.isAtTarget(target)) {
       return;
     }
 
@@ -163,12 +168,10 @@ export class GateAccessory {
     }
 
     this.clearFaults();
-    this.pendingTarget = target;
+    this.setPendingTarget(target);
+    this.markCommand(target);
     this.armTransitionTimer();
-    const nextState = target === this.platform.Characteristic.TargetDoorState.OPEN
-      ? this.platform.Characteristic.CurrentDoorState.OPENING
-      : this.platform.Characteristic.CurrentDoorState.CLOSING;
-    this.setCurrentState(nextState);
+    this.setCurrentState(this.resolveMovingState(target));
   }
 
   async handleObstructionDetectedGet(): Promise<CharacteristicValue> {
@@ -182,12 +185,14 @@ export class GateAccessory {
     }
     if (this.isClosedSensorActive) {
       if (this.pendingTarget === this.platform.Characteristic.TargetDoorState.OPEN) {
+        this.setTargetState(this.platform.Characteristic.TargetDoorState.OPEN);
         this.setCurrentState(this.platform.Characteristic.CurrentDoorState.OPENING);
         return;
       }
-      this.pendingTarget = undefined;
+      this.setPendingTarget(undefined);
       this.clearTransitionTimer();
       this.clearReverseToggleTimer();
+      this.clearOpenArrivalDebounceTimer();
       this.applyDoorState(
         this.platform.Characteristic.CurrentDoorState.CLOSED,
         this.platform.Characteristic.TargetDoorState.CLOSED,
@@ -195,53 +200,18 @@ export class GateAccessory {
       return;
     }
 
-    if (this.partialHiMode === 'moving') {
-      if (this.isPartialSensorActive) {
-        this.setCurrentState(this.resolveMovingState());
-        this.maybeSetIdleOpenTarget();
-        return;
-      }
-      this.setCurrentState(this.platform.Characteristic.CurrentDoorState.STOPPED);
-      this.maybeSetIdleOpenTarget();
+    if (this.pendingTarget === this.platform.Characteristic.TargetDoorState.OPEN
+      && this.shouldDebounceOpenArrival()) {
+      this.scheduleOpenArrivalDebounce();
       return;
     }
 
-    if (this.partialHiMode === 'open_endstop') {
-      if (this.isPartialSensorActive) {
-        this.pendingTarget = undefined;
-        this.clearTransitionTimer();
-        this.clearReverseToggleTimer();
-        this.applyDoorState(
-          this.platform.Characteristic.CurrentDoorState.OPEN,
-          this.platform.Characteristic.TargetDoorState.OPEN,
-        );
-        return;
-      }
-      if (this.pendingTarget !== undefined) {
-        this.setCurrentState(this.resolveMovingState());
-        return;
-      }
-      this.setCurrentState(this.platform.Characteristic.CurrentDoorState.STOPPED);
-      this.maybeSetIdleOpenTarget();
-      return;
-    }
-
-    if (this.partialHiMode === 'pedestrian_endstop') {
-      if (this.isPartialSensorActive) {
-        this.pendingTarget = undefined;
-        this.clearTransitionTimer();
-        this.clearReverseToggleTimer();
-        this.setCurrentState(this.platform.Characteristic.CurrentDoorState.STOPPED);
-        this.maybeSetIdleOpenTarget();
-        return;
-      }
-      if (this.pendingTarget !== undefined) {
-        this.setCurrentState(this.resolveMovingState());
-        return;
-      }
-      this.pendingTarget = undefined;
+    if (this.pendingTarget === this.platform.Characteristic.TargetDoorState.OPEN
+      && this.isOpenArrivalSignal()) {
+      this.setPendingTarget(undefined);
       this.clearTransitionTimer();
       this.clearReverseToggleTimer();
+      this.clearOpenArrivalDebounceTimer();
       this.applyDoorState(
         this.platform.Characteristic.CurrentDoorState.OPEN,
         this.platform.Characteristic.TargetDoorState.OPEN,
@@ -250,13 +220,18 @@ export class GateAccessory {
     }
 
     if (this.pendingTarget !== undefined) {
-      this.setCurrentState(this.resolveMovingState());
+      this.setTargetState(this.pendingTarget);
+      this.setCurrentState(this.resolveMovingState(this.pendingTarget));
       return;
     }
+
     this.clearTransitionTimer();
     this.clearReverseToggleTimer();
-    this.setCurrentState(this.platform.Characteristic.CurrentDoorState.STOPPED);
-    this.maybeSetIdleOpenTarget();
+    this.clearOpenArrivalDebounceTimer();
+    this.applyDoorState(
+      this.platform.Characteristic.CurrentDoorState.OPEN,
+      this.platform.Characteristic.TargetDoorState.OPEN,
+    );
   }
 
   private isAtTarget(target: number): boolean {
@@ -267,32 +242,8 @@ export class GateAccessory {
       return this.isClosedSensorActive;
     }
     if (target === this.platform.Characteristic.TargetDoorState.OPEN) {
-      if (this.partialHiMode === 'moving') {
-        return false;
-      }
-      if (this.partialHiMode === 'open_endstop') {
-        if (!this.hasPartialSensorState) {
-          return false;
-        }
-        return this.isPartialSensorActive;
-      }
-      if (this.partialHiMode === 'pedestrian_endstop') {
-        if (!this.hasClosedSensorState && !this.hasPartialSensorState) {
-          return false;
-        }
-        if (this.hasClosedSensorState && this.isClosedSensorActive) {
-          return false;
-        }
-        if (this.hasPartialSensorState && this.isPartialSensorActive) {
-          return false;
-        }
-        return true;
-      }
-      if (!this.hasClosedSensorState) {
-        return false;
-      }
-      return this.currentState === this.platform.Characteristic.CurrentDoorState.OPEN
-        && !this.isClosedSensorActive;
+      return this.isKnownNotClosed()
+        && this.currentState === this.platform.Characteristic.CurrentDoorState.OPEN;
     }
     return false;
   }
@@ -318,16 +269,6 @@ export class GateAccessory {
     this.service.updateCharacteristic(this.platform.Characteristic.TargetDoorState, this.targetState);
   }
 
-  private maybeSetIdleOpenTarget() {
-    if (this.pendingTarget !== undefined) {
-      return;
-    }
-    if (!this.isKnownNotClosed()) {
-      return;
-    }
-    this.setTargetState(this.platform.Characteristic.TargetDoorState.OPEN);
-  }
-
   private isKnownNotClosed(): boolean {
     if (this.hasClosedSensorState) {
       return !this.isClosedSensorActive;
@@ -335,15 +276,11 @@ export class GateAccessory {
     if (this.hasPartialSensorState && this.isPartialSensorActive) {
       return true;
     }
-    if (this.currentState === this.platform.Characteristic.CurrentDoorState.OPEN) {
-      return true;
-    }
-    return this.currentState === this.platform.Characteristic.CurrentDoorState.STOPPED
-      && this.targetState === this.platform.Characteristic.TargetDoorState.OPEN;
+    return this.currentState !== this.platform.Characteristic.CurrentDoorState.CLOSED;
   }
 
   private updateStatusFault() {
-    const fault = !this.connected || this.hasFault;
+    const fault = !this.connected;
     this.service.updateCharacteristic(
       this.platform.Characteristic.StatusFault,
       fault
@@ -353,29 +290,37 @@ export class GateAccessory {
   }
 
   private clearFaults() {
-    if (this.hasFault) {
-      this.hasFault = false;
-    }
     if (this.obstructionDetected) {
       this.obstructionDetected = false;
       this.service.updateCharacteristic(this.platform.Characteristic.ObstructionDetected, false);
     }
-    if (this.connected) {
-      this.updateStatusFault();
-    }
+    this.updateStatusFault();
   }
 
   private armTransitionTimer() {
     this.clearTransitionTimer();
     this.transitionTimer = setTimeout(() => {
       this.transitionTimer = undefined;
-      this.pendingTarget = undefined;
-      this.hasFault = true;
-      this.obstructionDetected = true;
-      this.updateStatusFault();
-      this.service.updateCharacteristic(this.platform.Characteristic.ObstructionDetected, true);
-      this.setCurrentState(this.platform.Characteristic.CurrentDoorState.STOPPED);
-      this.platform.log.warn(`Gate ${this.accessory.displayName} did not reach target within ${this.transitionTimeoutMs}ms.`);
+      const target = this.pendingTarget;
+      this.setPendingTarget(undefined);
+      this.clearReverseToggleTimer();
+      this.clearOpenArrivalDebounceTimer();
+      if (target === undefined) {
+        return;
+      }
+      const settled = this.resolveTerminalStateFromSensors();
+      if (settled !== undefined) {
+        this.applyDoorState(settled.current, settled.target);
+        return;
+      }
+      const assumedCurrent = target === this.platform.Characteristic.TargetDoorState.OPEN
+        ? this.platform.Characteristic.CurrentDoorState.OPEN
+        : this.platform.Characteristic.CurrentDoorState.CLOSED;
+      this.applyDoorState(assumedCurrent, target);
+      this.platform.log.warn(
+        `Gate ${this.accessory.displayName} did not confirm target within ${this.transitionTimeoutMs}ms; assuming ` +
+        `${target === this.platform.Characteristic.TargetDoorState.OPEN ? 'open' : 'closed'}.`,
+      );
     }, this.transitionTimeoutMs);
   }
 
@@ -393,6 +338,13 @@ export class GateAccessory {
     }
   }
 
+  private clearOpenArrivalDebounceTimer() {
+    if (this.openArrivalDebounceTimer) {
+      clearTimeout(this.openArrivalDebounceTimer);
+      this.openArrivalDebounceTimer = undefined;
+    }
+  }
+
   private touchTransitionTimer() {
     if (this.pendingTarget === undefined) {
       return;
@@ -400,14 +352,14 @@ export class GateAccessory {
     this.armTransitionTimer();
   }
 
-  private resolveMovingState(): number {
-    if (this.pendingTarget === this.platform.Characteristic.TargetDoorState.OPEN) {
+  private resolveMovingState(target: number): number {
+    if (target === this.platform.Characteristic.TargetDoorState.OPEN) {
       return this.platform.Characteristic.CurrentDoorState.OPENING;
     }
-    if (this.pendingTarget === this.platform.Characteristic.TargetDoorState.CLOSED) {
+    if (target === this.platform.Characteristic.TargetDoorState.CLOSED) {
       return this.platform.Characteristic.CurrentDoorState.CLOSING;
     }
-    return this.platform.Characteristic.CurrentDoorState.STOPPED;
+    return this.currentState;
   }
 
   private getMotionTarget(): number | undefined {
@@ -421,6 +373,105 @@ export class GateAccessory {
       return this.platform.Characteristic.TargetDoorState.CLOSED;
     }
     return undefined;
+  }
+
+  private isOpenArrivalSignal(): boolean {
+    if (this.partialHiMode === 'moving') {
+      if (!this.hasPartialSensorState) {
+        return true;
+      }
+      return this.hasPartialSensorState
+        && this.sawPartialMotionDuringPending
+        && !this.isPartialSensorActive;
+    }
+    if (!this.hasPartialSensorState) {
+      return false;
+    }
+    if (this.partialHiMode === 'open_endstop') {
+      return this.isPartialSensorActive;
+    }
+    if (this.partialHiMode === 'pedestrian_endstop') {
+      return this.isPartialSensorActive;
+    }
+    return false;
+  }
+
+  private shouldDebounceOpenArrival(): boolean {
+    return this.partialHiMode === 'moving'
+      && !this.hasPartialSensorState
+      && !this.isClosedSensorActive;
+  }
+
+  private scheduleOpenArrivalDebounce() {
+    if (this.openArrivalDebounceTimer) {
+      return;
+    }
+    this.openArrivalDebounceTimer = setTimeout(() => {
+      this.openArrivalDebounceTimer = undefined;
+      if (!this.connected) {
+        return;
+      }
+      if (this.pendingTarget !== this.platform.Characteristic.TargetDoorState.OPEN) {
+        return;
+      }
+      if (this.isClosedSensorActive) {
+        return;
+      }
+      this.setPendingTarget(undefined);
+      this.clearTransitionTimer();
+      this.clearReverseToggleTimer();
+      this.applyDoorState(
+        this.platform.Characteristic.CurrentDoorState.OPEN,
+        this.platform.Characteristic.TargetDoorState.OPEN,
+      );
+    }, this.openArrivalDebounceMs);
+  }
+
+  private resolveTerminalStateFromSensors():
+  {current: number; target: number} | undefined {
+    if (!this.hasClosedSensorState) {
+      return undefined;
+    }
+    if (this.isClosedSensorActive) {
+      return {
+        current: this.platform.Characteristic.CurrentDoorState.CLOSED,
+        target: this.platform.Characteristic.TargetDoorState.CLOSED,
+      };
+    }
+    return {
+      current: this.platform.Characteristic.CurrentDoorState.OPEN,
+      target: this.platform.Characteristic.TargetDoorState.OPEN,
+    };
+  }
+
+  private oppositeTarget(target: number): number {
+    return target === this.platform.Characteristic.TargetDoorState.OPEN
+      ? this.platform.Characteristic.TargetDoorState.CLOSED
+      : this.platform.Characteristic.TargetDoorState.OPEN;
+  }
+
+  private markCommand(target: number) {
+    this.lastCommandTarget = target;
+    this.lastCommandAt = Date.now();
+  }
+
+  private setPendingTarget(target: number | undefined) {
+    this.pendingTarget = target;
+    if (target !== this.platform.Characteristic.TargetDoorState.OPEN) {
+      this.clearOpenArrivalDebounceTimer();
+    }
+    if (target === undefined) {
+      this.sawPartialMotionDuringPending = false;
+      return;
+    }
+    this.sawPartialMotionDuringPending = this.hasPartialSensorState && this.isPartialSensorActive;
+  }
+
+  private isLikelyDuplicateSet(target: number): boolean {
+    if (this.lastCommandTarget !== target) {
+      return false;
+    }
+    return Date.now() - this.lastCommandAt <= this.duplicateSetWindowMs;
   }
 
   private publishGateAction(action: string, note?: string) {
