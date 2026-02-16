@@ -70,17 +70,17 @@
     "gateExecuteActionOpen": {
       "title": "Gate Execute Action Open",
       "type": "string",
-      "default": "open"
+      "default": "open_close"
     },
     "gateExecuteActionClose": {
       "title": "Gate Execute Action Close",
       "type": "string",
-      "default": "close"
+      "default": "open_close"
     },
     "gateExecuteActionToggle": {
       "title": "Gate Execute Action Toggle",
       "type": "string",
-      "default": "toggle"
+      "default": "open_close"
     },
     "gatePartialHiMode": {
       "title": "Gate Partial Hi Mode",
@@ -97,6 +97,31 @@
       "title": "Gate Reverse Follow-up Delay (ms)",
       "type": "number",
       "default": 3000
+    },
+    "gateOpenAssumeDelayMs": {
+      "title": "Gate Open Assume Delay (ms)",
+      "type": "number",
+      "default": 22000
+    },
+    "gateCommandCooldownMs": {
+      "title": "Gate Command Cooldown (ms)",
+      "type": "number",
+      "default": 700
+    },
+    "gatePublishRetryDelayMs": {
+      "title": "Gate Publish Retry Delay (ms)",
+      "type": "number",
+      "default": 300
+    },
+    "gateStrictReverseDoublePulse": {
+      "title": "Gate Strict Reverse Double Pulse",
+      "type": "boolean",
+      "default": true
+    },
+    "gateDebugTimeline": {
+      "title": "Gate Debug Timeline",
+      "type": "boolean",
+      "default": false
     },
     "gateLockControlMode": {
       "title": "Gate Lock Control Mode",

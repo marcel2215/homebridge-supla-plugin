@@ -26,13 +26,18 @@ export class GateAccessory {
   private reverseToggleTimer?: NodeJS.Timeout;
   private readonly reverseToggleDelayMs: number;
   private openArrivalDebounceTimer?: NodeJS.Timeout;
-  private readonly openArrivalDebounceMs = 450;
+  private readonly openArrivalDebounceMs: number;
   private lastCommandTarget?: number;
   private lastCommandAt = 0;
   private readonly duplicateSetWindowMs = 350;
   private sawPartialMotionDuringPending = false;
   private lastClosedReleaseAt = 0;
   private readonly externalDirectionHintWindowMs = 2500;
+  private readonly commandCooldownMs: number;
+  private readonly publishRetryDelayMs: number;
+  private readonly strictReverseDoublePulse: boolean;
+  private readonly debugTimeline: boolean;
+  private publishRetryTimer?: NodeJS.Timeout;
 
   constructor(
     private readonly platform: SuplaPlatform,
@@ -67,11 +72,17 @@ export class GateAccessory {
       this.clearTransitionTimer();
       this.clearReverseToggleTimer();
       this.clearOpenArrivalDebounceTimer();
+      this.clearPublishRetryTimer();
     });
 
     this.partialHiMode = this.platform.getGatePartialHiMode();
     this.baseTopic = this.platform.normalizeTopicBase(this.context.topic);
     this.reverseToggleDelayMs = this.platform.getGateReverseFollowUpDelayMs();
+    this.openArrivalDebounceMs = this.platform.getGateOpenAssumeDelayMs();
+    this.commandCooldownMs = this.platform.getGateCommandCooldownMs();
+    this.publishRetryDelayMs = this.platform.getGatePublishRetryDelayMs();
+    this.strictReverseDoublePulse = this.platform.getGateStrictReverseDoublePulse();
+    this.debugTimeline = this.platform.getGateDebugTimeline();
 
     this.platform.registerMqttHandler(
       `${this.baseTopic}/state/hi`,
@@ -122,6 +133,7 @@ export class GateAccessory {
           this.clearTransitionTimer();
           this.clearReverseToggleTimer();
           this.clearOpenArrivalDebounceTimer();
+          this.clearPublishRetryTimer();
         }
       },
       this.accessory.UUID,
@@ -144,8 +156,16 @@ export class GateAccessory {
     const motionTarget = this.getMotionTarget();
     const isMoving = motionTarget !== undefined;
     let target = requestedTarget;
+    this.logGateTimeline('set-request', {
+      requested: this.describeTargetState(requestedTarget),
+      motion: this.describeTargetState(motionTarget),
+      mode,
+    });
     if (isMoving && motionTarget !== undefined && requestedTarget === motionTarget) {
       if (this.isLikelyDuplicateSet(requestedTarget)) {
+        this.logGateTimeline('set-ignored-duplicate', {
+          requested: this.describeTargetState(requestedTarget),
+        });
         return;
       }
       target = this.oppositeTarget(requestedTarget);
@@ -153,19 +173,38 @@ export class GateAccessory {
     const previousTarget = this.targetState;
     this.setTargetState(target);
     this.clearReverseToggleTimer();
+    this.clearPublishRetryTimer();
 
     if (!this.connected) {
       this.platform.log.warn(`Gate ${this.accessory.displayName} is offline; ignoring command.`);
       this.setTargetState(previousTarget);
       this.updateStatusFault();
+      this.logGateTimeline('set-ignored-offline', {
+        requested: this.describeTargetState(requestedTarget),
+      });
       return;
     }
 
     if (!isMoving && this.isAtTarget(target)) {
+      this.logGateTimeline('set-ignored-at-target', {
+        target: this.describeTargetState(target),
+      });
       return;
     }
 
     if (this.pendingTarget === target) {
+      this.logGateTimeline('set-ignored-pending', {
+        target: this.describeTargetState(target),
+      });
+      return;
+    }
+
+    if (this.isCommandInCooldown(target, motionTarget)) {
+      this.setTargetState(previousTarget);
+      this.logGateTimeline('set-ignored-cooldown', {
+        target: this.describeTargetState(target),
+        cooldownMs: this.commandCooldownMs,
+      });
       return;
     }
 
@@ -183,7 +222,7 @@ export class GateAccessory {
       return;
     }
     const isReversing = motionTarget !== undefined && motionTarget !== target;
-    this.publishGateAction(action, isReversing ? 'reverse' : undefined);
+    this.publishGateAction(action, isReversing ? 'reverse' : undefined, target);
     if (isReversing && this.shouldScheduleReverseFollowUp(mode)) {
       this.scheduleReverseToggle(action, target, mode);
     }
@@ -193,6 +232,11 @@ export class GateAccessory {
     this.markCommand(target);
     this.armTransitionTimer();
     this.setCurrentState(this.resolveMovingState(target));
+    this.logGateTimeline('set-applied', {
+      action,
+      target: this.describeTargetState(target),
+      reversing: isReversing,
+    });
   }
 
   async handleObstructionDetectedGet(): Promise<CharacteristicValue> {
@@ -204,6 +248,12 @@ export class GateAccessory {
       (context.closedPrevious !== undefined && context.closedPrevious !== this.isClosedSensorActive)
       || (context.partialPrevious !== undefined && context.partialPrevious !== this.isPartialSensorActive)
     );
+    if (changed) {
+      this.logGateTimeline('sensor-change', {
+        closed: this.describeSensorValue(this.hasClosedSensorState, this.isClosedSensorActive),
+        partial: this.describeSensorValue(this.hasPartialSensorState, this.isPartialSensorActive),
+      });
+    }
     this.clearFaults();
     if (changed) {
       this.touchTransitionTimer();
@@ -247,6 +297,15 @@ export class GateAccessory {
     if (this.pendingTarget !== undefined) {
       this.setTargetState(this.pendingTarget);
       this.setCurrentState(this.resolveMovingState(this.pendingTarget));
+      return;
+    }
+
+    if (this.shouldAssumeExternalOpeningFromClosed(context)) {
+      this.setPendingTarget(this.platform.Characteristic.TargetDoorState.OPEN);
+      this.setTargetState(this.platform.Characteristic.TargetDoorState.OPEN);
+      this.setCurrentState(this.platform.Characteristic.CurrentDoorState.OPENING);
+      this.armTransitionTimer();
+      this.scheduleOpenArrivalDebounce();
       return;
     }
 
@@ -355,6 +414,9 @@ export class GateAccessory {
         `Gate ${this.accessory.displayName} did not confirm target within ${this.transitionTimeoutMs}ms; assuming ` +
         `${target === this.platform.Characteristic.TargetDoorState.OPEN ? 'open' : 'closed'}.`,
       );
+      this.logGateTimeline('transition-timeout-assumed', {
+        assumedTarget: this.describeTargetState(target),
+      });
     }, this.transitionTimeoutMs);
   }
 
@@ -376,6 +438,13 @@ export class GateAccessory {
     if (this.openArrivalDebounceTimer) {
       clearTimeout(this.openArrivalDebounceTimer);
       this.openArrivalDebounceTimer = undefined;
+    }
+  }
+
+  private clearPublishRetryTimer() {
+    if (this.publishRetryTimer) {
+      clearTimeout(this.publishRetryTimer);
+      this.publishRetryTimer = undefined;
     }
   }
 
@@ -431,9 +500,19 @@ export class GateAccessory {
   }
 
   private shouldDebounceOpenArrival(): boolean {
-    return this.partialHiMode === 'moving'
-      && !this.hasPartialSensorState
-      && !this.isClosedSensorActive;
+    if (this.isClosedSensorActive) {
+      return false;
+    }
+    if (this.partialHiMode === 'ignore') {
+      return true;
+    }
+    return this.partialHiMode === 'moving' && !this.hasPartialSensorState;
+  }
+
+  private shouldAssumeExternalOpeningFromClosed(context: SensorUpdateContext): boolean {
+    return context.closedPrevious === true
+      && !this.isClosedSensorActive
+      && this.shouldDebounceOpenArrival();
   }
 
   private scheduleOpenArrivalDebounce() {
@@ -458,6 +537,9 @@ export class GateAccessory {
         this.platform.Characteristic.CurrentDoorState.OPEN,
         this.platform.Characteristic.TargetDoorState.OPEN,
       );
+      this.logGateTimeline('open-assumed-arrival', {
+        debounceMs: this.openArrivalDebounceMs,
+      });
     }, this.openArrivalDebounceMs);
   }
 
@@ -508,13 +590,49 @@ export class GateAccessory {
     return Date.now() - this.lastCommandAt <= this.duplicateSetWindowMs;
   }
 
-  private publishGateAction(action: string, note?: string) {
+  private publishGateAction(action: string, note?: string, expectedTarget?: number, isRetry = false) {
     const suffix = note ? ` (${note})` : '';
     this.platform.log.debug(`Publishing ${this.baseTopic}/execute_action = ${action}${suffix}`);
-    this.platform.publishCommand(
-      `${this.baseTopic}/execute_action`,
+    this.logGateTimeline(isRetry ? 'publish-retry' : 'publish', {
       action,
-    );
+      note: note ?? 'none',
+      expected: this.describeTargetState(expectedTarget),
+    });
+    this.platform.publishCommand(`${this.baseTopic}/execute_action`, action, (error) => {
+      if (!error) {
+        return;
+      }
+      this.platform.log.warn(
+        `Gate ${this.accessory.displayName} publish failed (${action}): ${error.message}`,
+      );
+      this.logGateTimeline('publish-failed', {
+        action,
+        retry: !isRetry && this.publishRetryDelayMs > 0,
+      });
+      if (isRetry || this.publishRetryDelayMs <= 0) {
+        return;
+      }
+      this.schedulePublishRetry(action, note, expectedTarget);
+    });
+  }
+
+  private schedulePublishRetry(action: string, note?: string, expectedTarget?: number) {
+    this.clearPublishRetryTimer();
+    this.publishRetryTimer = setTimeout(() => {
+      this.publishRetryTimer = undefined;
+      if (!this.connected) {
+        return;
+      }
+      if (expectedTarget !== undefined && this.pendingTarget !== expectedTarget) {
+        return;
+      }
+      this.publishGateAction(action, note, expectedTarget, true);
+    }, this.publishRetryDelayMs);
+    this.logGateTimeline('publish-retry-scheduled', {
+      action,
+      retryDelayMs: this.publishRetryDelayMs,
+      expected: this.describeTargetState(expectedTarget),
+    });
   }
 
   private scheduleReverseToggle(
@@ -531,24 +649,48 @@ export class GateAccessory {
       if (this.pendingTarget !== expectedTarget) {
         return;
       }
-      if (mode === 'execute_action' && !this.shouldPublishExecuteActionReverseFollowUp()) {
+      if (!this.strictReverseDoublePulse
+        && mode === 'execute_action'
+        && this.isOpenCloseExecuteActionPair()
+        && !this.shouldPublishExecuteActionReverseFollowUp()) {
+        this.logGateTimeline('reverse-2-skipped', {
+          reason: 'motion-confirmed',
+          strict: this.strictReverseDoublePulse,
+        });
         return;
       }
-      this.publishGateAction(action, 'reverse-2');
+      this.publishGateAction(action, 'reverse-2', expectedTarget);
     }, this.reverseToggleDelayMs);
+    this.logGateTimeline('reverse-2-scheduled', {
+      action,
+      mode,
+      delayMs: this.reverseToggleDelayMs,
+      expected: this.describeTargetState(expectedTarget),
+    });
   }
 
   private shouldScheduleReverseFollowUp(mode: 'execute_action' | 'toggle'): boolean {
     if (mode === 'toggle') {
       return true;
     }
-    return this.isOpenCloseExecuteActionPair();
+    return this.isOpenCloseExecuteActionPair() || this.isSingleExecuteActionPair();
   }
 
   private isOpenCloseExecuteActionPair(): boolean {
-    const normalize = (value: string): string => value.trim().toLowerCase();
-    return normalize(this.platform.getGateExecuteActionOpen()) === 'open'
-      && normalize(this.platform.getGateExecuteActionClose()) === 'close';
+    return this.normalizeAction(this.platform.getGateExecuteActionOpen()) === 'open'
+      && this.normalizeAction(this.platform.getGateExecuteActionClose()) === 'close';
+  }
+
+  private isSingleExecuteActionPair(): boolean {
+    const openAction = this.normalizeAction(this.platform.getGateExecuteActionOpen());
+    if (!openAction) {
+      return false;
+    }
+    return openAction === this.normalizeAction(this.platform.getGateExecuteActionClose());
+  }
+
+  private normalizeAction(value: string): string {
+    return value.trim().toLowerCase();
   }
 
   private shouldPublishExecuteActionReverseFollowUp(): boolean {
@@ -604,5 +746,78 @@ export class GateAccessory {
       return false;
     }
     return Date.now() - this.lastClosedReleaseAt <= this.externalDirectionHintWindowMs;
+  }
+
+  private isCommandInCooldown(target: number, motionTarget: number | undefined): boolean {
+    if (this.commandCooldownMs <= 0 || this.lastCommandAt === 0) {
+      return false;
+    }
+    if (Date.now() - this.lastCommandAt > this.commandCooldownMs) {
+      return false;
+    }
+    const isReverse = motionTarget !== undefined && motionTarget !== target;
+    return !isReverse;
+  }
+
+  private describeTargetState(value: number | undefined): string {
+    if (value === undefined) {
+      return 'none';
+    }
+    if (value === this.platform.Characteristic.TargetDoorState.OPEN) {
+      return 'open';
+    }
+    if (value === this.platform.Characteristic.TargetDoorState.CLOSED) {
+      return 'closed';
+    }
+    return `unknown(${value})`;
+  }
+
+  private describeCurrentState(value: number): string {
+    if (value === this.platform.Characteristic.CurrentDoorState.OPEN) {
+      return 'open';
+    }
+    if (value === this.platform.Characteristic.CurrentDoorState.CLOSED) {
+      return 'closed';
+    }
+    if (value === this.platform.Characteristic.CurrentDoorState.OPENING) {
+      return 'opening';
+    }
+    if (value === this.platform.Characteristic.CurrentDoorState.CLOSING) {
+      return 'closing';
+    }
+    if (value === this.platform.Characteristic.CurrentDoorState.STOPPED) {
+      return 'stopped';
+    }
+    return `unknown(${value})`;
+  }
+
+  private describeSensorValue(hasValue: boolean, value: boolean): string {
+    if (!hasValue) {
+      return 'unknown';
+    }
+    return value ? 'true' : 'false';
+  }
+
+  private logGateTimeline(event: string, context?: Record<string, unknown>) {
+    if (!this.debugTimeline) {
+      return;
+    }
+    const snapshot: Record<string, unknown> = {
+      event,
+      current: this.describeCurrentState(this.currentState),
+      target: this.describeTargetState(this.targetState),
+      pending: this.describeTargetState(this.pendingTarget),
+      connected: this.connected,
+      closed: this.describeSensorValue(this.hasClosedSensorState, this.isClosedSensorActive),
+      partial: this.describeSensorValue(this.hasPartialSensorState, this.isPartialSensorActive),
+    };
+    const merged = {
+      ...snapshot,
+      ...context,
+    };
+    const details = Object.entries(merged)
+      .map(([key, value]) => `${key}=${String(value)}`)
+      .join(' ');
+    this.platform.log.info(`[GateDebug ${this.accessory.displayName}] ${details}`);
   }
 }

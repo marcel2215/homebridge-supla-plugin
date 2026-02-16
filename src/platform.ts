@@ -57,6 +57,11 @@ export class SuplaPlatform implements DynamicPlatformPlugin {
   private readonly gateLockSetOffPayload: string;
   private readonly gatePartialHiMode: 'moving' | 'open_endstop' | 'pedestrian_endstop' | 'ignore';
   private readonly gateReverseFollowUpDelayMs: number;
+  private readonly gateOpenAssumeDelayMs: number;
+  private readonly gateCommandCooldownMs: number;
+  private readonly gatePublishRetryDelayMs: number;
+  private readonly gateStrictReverseDoublePulse: boolean;
+  private readonly gateDebugTimeline: boolean;
   private readonly commandQos: 0 | 1 | 2;
   private readonly commandRetain: boolean;
   private readonly mqttHandlers = new Map<string, Set<(message: Buffer, topic: string) => void>>();
@@ -103,6 +108,11 @@ export class SuplaPlatform implements DynamicPlatformPlugin {
       gateLockSetOffPayload?: string;
       gatePartialHiMode?: string;
       gateReverseFollowUpDelayMs?: number;
+      gateOpenAssumeDelayMs?: number;
+      gateCommandCooldownMs?: number;
+      gatePublishRetryDelayMs?: number;
+      gateStrictReverseDoublePulse?: boolean | string;
+      gateDebugTimeline?: boolean | string;
       commandQos?: number;
       commandRetain?: boolean | string;
     };
@@ -114,9 +124,9 @@ export class SuplaPlatform implements DynamicPlatformPlugin {
     this.coveringExecuteActionStop = (configView.coveringExecuteActionStop || 'stop').toString();
     this.coveringTravelTimeSeconds = Number(configView.coveringTravelTimeSeconds) || 0;
     this.gateControlMode = this.normalizeGateControlMode(configView.gateControlMode);
-    this.gateExecuteActionOpen = (configView.gateExecuteActionOpen || 'open').toString();
-    this.gateExecuteActionClose = (configView.gateExecuteActionClose || 'close').toString();
-    this.gateExecuteActionToggle = (configView.gateExecuteActionToggle || 'toggle').toString();
+    this.gateExecuteActionOpen = (configView.gateExecuteActionOpen || 'open_close').toString();
+    this.gateExecuteActionClose = (configView.gateExecuteActionClose || 'open_close').toString();
+    this.gateExecuteActionToggle = (configView.gateExecuteActionToggle || 'open_close').toString();
     this.gateLockControlMode = this.normalizeGateLockControlMode(configView.gateLockControlMode);
     this.gateLockExecuteAction = (configView.gateLockExecuteAction || 'open').toString();
     this.gateLockSetTopicSuffix = this.normalizeTopicSuffix(configView.gateLockSetTopicSuffix || 'set/on');
@@ -127,6 +137,19 @@ export class SuplaPlatform implements DynamicPlatformPlugin {
     this.gateReverseFollowUpDelayMs = this.normalizeGateReverseFollowUpDelayMs(
       configView.gateReverseFollowUpDelayMs,
     );
+    this.gateOpenAssumeDelayMs = this.normalizeGateOpenAssumeDelayMs(
+      configView.gateOpenAssumeDelayMs,
+    );
+    this.gateCommandCooldownMs = this.normalizeGateCommandCooldownMs(
+      configView.gateCommandCooldownMs,
+    );
+    this.gatePublishRetryDelayMs = this.normalizeGatePublishRetryDelayMs(
+      configView.gatePublishRetryDelayMs,
+    );
+    this.gateStrictReverseDoublePulse = this.parseBoolean(
+      configView.gateStrictReverseDoublePulse ?? true,
+    );
+    this.gateDebugTimeline = this.parseBoolean(configView.gateDebugTimeline ?? false);
     this.commandQos = this.normalizeCommandQos(configView.commandQos);
     this.commandRetain = this.parseBoolean(configView.commandRetain ?? false);
 
@@ -590,6 +613,26 @@ export class SuplaPlatform implements DynamicPlatformPlugin {
     return this.gateReverseFollowUpDelayMs;
   }
 
+  public getGateOpenAssumeDelayMs(): number {
+    return this.gateOpenAssumeDelayMs;
+  }
+
+  public getGateCommandCooldownMs(): number {
+    return this.gateCommandCooldownMs;
+  }
+
+  public getGatePublishRetryDelayMs(): number {
+    return this.gatePublishRetryDelayMs;
+  }
+
+  public getGateStrictReverseDoublePulse(): boolean {
+    return this.gateStrictReverseDoublePulse;
+  }
+
+  public getGateDebugTimeline(): boolean {
+    return this.gateDebugTimeline;
+  }
+
   private normalizeCoveringControlMode(value?: string): 'set' | 'execute_action' | 'hybrid' {
     const normalized = (value ?? 'set').toString().toLowerCase();
     if (normalized === 'execute_action') {
@@ -641,6 +684,36 @@ export class SuplaPlatform implements DynamicPlatformPlugin {
     }
     const rounded = Math.round(parsed);
     return Math.min(10000, Math.max(250, rounded));
+  }
+
+  private normalizeGateOpenAssumeDelayMs(value?: number): number {
+    const fallbackMs = 22000;
+    const parsed = Number(value);
+    if (!Number.isFinite(parsed)) {
+      return fallbackMs;
+    }
+    const rounded = Math.round(parsed);
+    return Math.min(120000, Math.max(1000, rounded));
+  }
+
+  private normalizeGateCommandCooldownMs(value?: number): number {
+    const fallbackMs = 700;
+    const parsed = Number(value);
+    if (!Number.isFinite(parsed)) {
+      return fallbackMs;
+    }
+    const rounded = Math.round(parsed);
+    return Math.min(10000, Math.max(0, rounded));
+  }
+
+  private normalizeGatePublishRetryDelayMs(value?: number): number {
+    const fallbackMs = 300;
+    const parsed = Number(value);
+    if (!Number.isFinite(parsed)) {
+      return fallbackMs;
+    }
+    const rounded = Math.round(parsed);
+    return Math.min(5000, Math.max(0, rounded));
   }
 
   private normalizeTopicSuffix(value: string): string {
