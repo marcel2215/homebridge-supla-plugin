@@ -24,7 +24,7 @@ export class GateAccessory {
   private readonly partialHiMode: PartialHiMode;
   private readonly baseTopic: string;
   private reverseToggleTimer?: NodeJS.Timeout;
-  private readonly reverseToggleDelayMs = 1200;
+  private readonly reverseToggleDelayMs: number;
   private openArrivalDebounceTimer?: NodeJS.Timeout;
   private readonly openArrivalDebounceMs = 450;
   private lastCommandTarget?: number;
@@ -71,6 +71,7 @@ export class GateAccessory {
 
     this.partialHiMode = this.platform.getGatePartialHiMode();
     this.baseTopic = this.platform.normalizeTopicBase(this.context.topic);
+    this.reverseToggleDelayMs = this.platform.getGateReverseFollowUpDelayMs();
 
     this.platform.registerMqttHandler(
       `${this.baseTopic}/state/hi`,

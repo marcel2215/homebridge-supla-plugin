@@ -93,6 +93,11 @@
         "ignore"
       ]
     },
+    "gateReverseFollowUpDelayMs": {
+      "title": "Gate Reverse Follow-up Delay (ms)",
+      "type": "number",
+      "default": 3000
+    },
     "gateLockControlMode": {
       "title": "Gate Lock Control Mode",
       "type": "string",

@@ -56,6 +56,7 @@ export class SuplaPlatform implements DynamicPlatformPlugin {
   private readonly gateLockSetOnPayload: string;
   private readonly gateLockSetOffPayload: string;
   private readonly gatePartialHiMode: 'moving' | 'open_endstop' | 'pedestrian_endstop' | 'ignore';
+  private readonly gateReverseFollowUpDelayMs: number;
   private readonly commandQos: 0 | 1 | 2;
   private readonly commandRetain: boolean;
   private readonly mqttHandlers = new Map<string, Set<(message: Buffer, topic: string) => void>>();
@@ -101,6 +102,7 @@ export class SuplaPlatform implements DynamicPlatformPlugin {
       gateLockSetOnPayload?: string;
       gateLockSetOffPayload?: string;
       gatePartialHiMode?: string;
+      gateReverseFollowUpDelayMs?: number;
       commandQos?: number;
       commandRetain?: boolean | string;
     };
@@ -122,6 +124,9 @@ export class SuplaPlatform implements DynamicPlatformPlugin {
     this.gateLockSetOnPayload = (configView.gateLockSetOnPayload ?? 'true').toString();
     this.gateLockSetOffPayload = (configView.gateLockSetOffPayload ?? 'false').toString();
     this.gatePartialHiMode = this.normalizeGatePartialHiMode(configView.gatePartialHiMode);
+    this.gateReverseFollowUpDelayMs = this.normalizeGateReverseFollowUpDelayMs(
+      configView.gateReverseFollowUpDelayMs,
+    );
     this.commandQos = this.normalizeCommandQos(configView.commandQos);
     this.commandRetain = this.parseBoolean(configView.commandRetain ?? false);
 
@@ -581,6 +586,10 @@ export class SuplaPlatform implements DynamicPlatformPlugin {
     return this.gatePartialHiMode;
   }
 
+  public getGateReverseFollowUpDelayMs(): number {
+    return this.gateReverseFollowUpDelayMs;
+  }
+
   private normalizeCoveringControlMode(value?: string): 'set' | 'execute_action' | 'hybrid' {
     const normalized = (value ?? 'set').toString().toLowerCase();
     if (normalized === 'execute_action') {
@@ -622,6 +631,16 @@ export class SuplaPlatform implements DynamicPlatformPlugin {
       return 'ignore';
     }
     return 'moving';
+  }
+
+  private normalizeGateReverseFollowUpDelayMs(value?: number): number {
+    const fallbackMs = 3000;
+    const parsed = Number(value);
+    if (!Number.isFinite(parsed)) {
+      return fallbackMs;
+    }
+    const rounded = Math.round(parsed);
+    return Math.min(10000, Math.max(250, rounded));
   }
 
   private normalizeTopicSuffix(value: string): string {
