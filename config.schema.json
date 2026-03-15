@@ -123,6 +123,31 @@
       "type": "boolean",
       "default": false
     },
+    "frontGateFullTravelMs": {
+      "title": "Front Gate Full Travel (ms)",
+      "type": "number",
+      "default": 25000
+    },
+    "frontGateReversePauseMs": {
+      "title": "Front Gate Reverse Pause (ms)",
+      "type": "number",
+      "default": 900
+    },
+    "frontGateWrongDirectionRunMs": {
+      "title": "Front Gate Wrong Direction Run (ms)",
+      "type": "number",
+      "default": 700
+    },
+    "frontGateMinimumPulseGapMs": {
+      "title": "Front Gate Minimum Pulse Gap (ms)",
+      "type": "number",
+      "default": 400
+    },
+    "frontGateCloseRetryLimit": {
+      "title": "Front Gate Close Retry Limit",
+      "type": "number",
+      "default": 1
+    },
     "gateLockControlMode": {
       "title": "Gate Lock Control Mode",
       "type": "string",

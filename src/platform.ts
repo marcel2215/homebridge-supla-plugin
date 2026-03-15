@@ -25,6 +25,7 @@ import {ThermostatAccessory} from './Accesories/ThermostatAccessory';
 import {ElectricityMeterAccessory} from './Accesories/ElectricityMeterAccessory';
 import {DimmerRgbLightAccessory} from './Accesories/DimmerRgbLightAccessory';
 import {ActionTriggerAccessory} from './Accesories/ActionTriggerAccessory';
+import type {FrontGateTimingConfig} from './Accesories/FrontGateFsm';
 
 
 /**
@@ -62,6 +63,11 @@ export class SuplaPlatform implements DynamicPlatformPlugin {
   private readonly gatePublishRetryDelayMs: number;
   private readonly gateStrictReverseDoublePulse: boolean;
   private readonly gateDebugTimeline: boolean;
+  private readonly frontGateFullTravelMs: number;
+  private readonly frontGateReversePauseMs: number;
+  private readonly frontGateWrongDirectionRunMs: number;
+  private readonly frontGateMinimumPulseGapMs: number;
+  private readonly frontGateCloseRetryLimit: number;
   private readonly commandQos: 0 | 1 | 2;
   private readonly commandRetain: boolean;
   private readonly mqttHandlers = new Map<string, Set<(message: Buffer, topic: string) => void>>();
@@ -113,6 +119,11 @@ export class SuplaPlatform implements DynamicPlatformPlugin {
       gatePublishRetryDelayMs?: number;
       gateStrictReverseDoublePulse?: boolean | string;
       gateDebugTimeline?: boolean | string;
+      frontGateFullTravelMs?: number;
+      frontGateReversePauseMs?: number;
+      frontGateWrongDirectionRunMs?: number;
+      frontGateMinimumPulseGapMs?: number;
+      frontGateCloseRetryLimit?: number;
       commandQos?: number;
       commandRetain?: boolean | string;
     };
@@ -150,6 +161,21 @@ export class SuplaPlatform implements DynamicPlatformPlugin {
       configView.gateStrictReverseDoublePulse ?? true,
     );
     this.gateDebugTimeline = this.parseBoolean(configView.gateDebugTimeline ?? false);
+    this.frontGateFullTravelMs = this.normalizeFrontGateFullTravelMs(
+      configView.frontGateFullTravelMs ?? configView.gateOpenAssumeDelayMs,
+    );
+    this.frontGateReversePauseMs = this.normalizeFrontGateReversePauseMs(
+      configView.frontGateReversePauseMs,
+    );
+    this.frontGateWrongDirectionRunMs = this.normalizeFrontGateWrongDirectionRunMs(
+      configView.frontGateWrongDirectionRunMs,
+    );
+    this.frontGateMinimumPulseGapMs = this.normalizeFrontGateMinimumPulseGapMs(
+      configView.frontGateMinimumPulseGapMs ?? configView.gateCommandCooldownMs,
+    );
+    this.frontGateCloseRetryLimit = this.normalizeFrontGateCloseRetryLimit(
+      configView.frontGateCloseRetryLimit,
+    );
     this.commandQos = this.normalizeCommandQos(configView.commandQos);
     this.commandRetain = this.parseBoolean(configView.commandRetain ?? false);
 
@@ -633,6 +659,33 @@ export class SuplaPlatform implements DynamicPlatformPlugin {
     return this.gateDebugTimeline;
   }
 
+  public getFrontGateTimings(): FrontGateTimingConfig {
+    return {
+      fullTravelMs: this.frontGateFullTravelMs,
+      reversePauseMs: this.frontGateReversePauseMs,
+      wrongDirectionRunMs: this.frontGateWrongDirectionRunMs,
+      minimumPulseGapMs: this.frontGateMinimumPulseGapMs,
+      closeRetryLimit: this.frontGateCloseRetryLimit,
+    };
+  }
+
+  public getFrontGatePulseAction(): string {
+    const toggleAction = this.gateExecuteActionToggle.trim();
+    if (toggleAction) {
+      return toggleAction;
+    }
+
+    const openAction = this.gateExecuteActionOpen.trim();
+    const closeAction = this.gateExecuteActionClose.trim();
+    if (openAction && openAction === closeAction) {
+      return openAction;
+    }
+    if (openAction) {
+      return openAction;
+    }
+    return closeAction;
+  }
+
   private normalizeCoveringControlMode(value?: string): 'set' | 'execute_action' | 'hybrid' {
     const normalized = (value ?? 'set').toString().toLowerCase();
     if (normalized === 'execute_action') {
@@ -714,6 +767,56 @@ export class SuplaPlatform implements DynamicPlatformPlugin {
     }
     const rounded = Math.round(parsed);
     return Math.min(5000, Math.max(0, rounded));
+  }
+
+  private normalizeFrontGateFullTravelMs(value?: number): number {
+    const fallbackMs = 25000;
+    const parsed = Number(value);
+    if (!Number.isFinite(parsed)) {
+      return fallbackMs;
+    }
+    const rounded = Math.round(parsed);
+    return Math.min(120000, Math.max(5000, rounded));
+  }
+
+  private normalizeFrontGateReversePauseMs(value?: number): number {
+    const fallbackMs = 900;
+    const parsed = Number(value);
+    if (!Number.isFinite(parsed)) {
+      return fallbackMs;
+    }
+    const rounded = Math.round(parsed);
+    return Math.min(10000, Math.max(100, rounded));
+  }
+
+  private normalizeFrontGateWrongDirectionRunMs(value?: number): number {
+    const fallbackMs = 700;
+    const parsed = Number(value);
+    if (!Number.isFinite(parsed)) {
+      return fallbackMs;
+    }
+    const rounded = Math.round(parsed);
+    return Math.min(5000, Math.max(100, rounded));
+  }
+
+  private normalizeFrontGateMinimumPulseGapMs(value?: number): number {
+    const fallbackMs = 400;
+    const parsed = Number(value);
+    if (!Number.isFinite(parsed)) {
+      return fallbackMs;
+    }
+    const rounded = Math.round(parsed);
+    return Math.min(10000, Math.max(0, rounded));
+  }
+
+  private normalizeFrontGateCloseRetryLimit(value?: number): number {
+    const fallbackValue = 1;
+    const parsed = Number(value);
+    if (!Number.isFinite(parsed)) {
+      return fallbackValue;
+    }
+    const rounded = Math.round(parsed);
+    return Math.min(3, Math.max(0, rounded));
   }
 
   private normalizeTopicSuffix(value: string): string {

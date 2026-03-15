@@ -1,43 +1,31 @@
 import { CharacteristicValue, PlatformAccessory, Service } from 'homebridge';
 import { SuplaPlatform } from '../platform';
 import { SuplaChannelContext } from '../Heplers/SuplaChannelContext';
+import {
+  DoorTargetState,
+  FrontGateFsm,
+  FrontGateSnapshot,
+} from './FrontGateFsm';
 
-type PartialHiMode = 'moving' | 'open_endstop' | 'pedestrian_endstop' | 'ignore';
-type SensorUpdateContext = {
-  closedPrevious?: boolean;
-  partialPrevious?: boolean;
+type FrontGateConfigView = {
+  channels?: unknown;
+  frontGateSensorTopic?: string;
+  frontGateSensorDeviceId?: string | number;
+  frontGateSensorChannelId?: string | number;
+};
+
+type SensorCandidate = {
+  channel: SuplaChannelContext;
+  baseTopic: string;
+  score: number;
+  reasons: string[];
 };
 
 export class GateAccessory {
-  private service: Service;
-  private currentState = this.platform.Characteristic.CurrentDoorState.CLOSED;
-  private targetState = this.platform.Characteristic.TargetDoorState.CLOSED;
-  private connected = true;
-  private obstructionDetected = false;
-  private isClosedSensorActive = false;
-  private isPartialSensorActive = false;
-  private hasClosedSensorState = false;
-  private hasPartialSensorState = false;
-  private pendingTarget?: number;
-  private transitionTimer?: NodeJS.Timeout;
-  private readonly transitionTimeoutMs = 60000;
-  private readonly partialHiMode: PartialHiMode;
-  private readonly baseTopic: string;
-  private reverseToggleTimer?: NodeJS.Timeout;
-  private readonly reverseToggleDelayMs: number;
-  private openArrivalDebounceTimer?: NodeJS.Timeout;
-  private readonly openArrivalDebounceMs: number;
-  private lastCommandTarget?: number;
-  private lastCommandAt = 0;
-  private readonly duplicateSetWindowMs = 350;
-  private sawPartialMotionDuringPending = false;
-  private lastClosedReleaseAt = 0;
-  private readonly externalDirectionHintWindowMs = 2500;
-  private readonly commandCooldownMs: number;
-  private readonly publishRetryDelayMs: number;
-  private readonly strictReverseDoublePulse: boolean;
-  private readonly debugTimeline: boolean;
-  private publishRetryTimer?: NodeJS.Timeout;
+  private readonly service: Service;
+  private readonly controlBaseTopic: string;
+  private readonly sensorBaseTopic: string;
+  private readonly fsm: FrontGateFsm;
 
   constructor(
     private readonly platform: SuplaPlatform,
@@ -55,8 +43,27 @@ export class GateAccessory {
 
     this.service = this.accessory.getService(this.platform.Service.GarageDoorOpener)
       || this.accessory.addService(this.platform.Service.GarageDoorOpener);
-
     this.service.setCharacteristic(this.platform.Characteristic.Name, accessory.displayName);
+
+    this.controlBaseTopic = this.platform.normalizeTopicBase(this.context.topic);
+    this.sensorBaseTopic = this.resolveSensorBaseTopic();
+
+    // Remove stale persisted direction state from the previous implementation.
+    delete this.accessory.context.frontGateFsm;
+
+    this.fsm = new FrontGateFsm(
+      {
+        pulseMotor: async (reason) => this.publishPulse(reason),
+        publishSnapshot: (snapshot) => this.applySnapshot(snapshot),
+        log: {
+          debug: (message) => this.platform.log.debug(`[FrontGate ${this.accessory.displayName}] ${message}`),
+          info: (message) => this.platform.log.info(`[FrontGate ${this.accessory.displayName}] ${message}`),
+          warn: (message) => this.platform.log.warn(`[FrontGate ${this.accessory.displayName}] ${message}`),
+        },
+      },
+      this.platform.getFrontGateTimings(),
+      {},
+    );
 
     this.service.getCharacteristic(this.platform.Characteristic.CurrentDoorState)
       .onGet(this.handleCurrentDoorStateGet.bind(this));
@@ -66,758 +73,356 @@ export class GateAccessory {
     this.service.getCharacteristic(this.platform.Characteristic.ObstructionDetected)
       .onGet(this.handleObstructionDetectedGet.bind(this));
 
-    this.service.setCharacteristic(this.platform.Characteristic.ObstructionDetected, false);
+    this.service.updateCharacteristic(this.platform.Characteristic.ObstructionDetected, false);
 
     this.platform.registerOwnerCleanup(this.accessory.UUID, () => {
-      this.clearTransitionTimer();
-      this.clearReverseToggleTimer();
-      this.clearOpenArrivalDebounceTimer();
-      this.clearPublishRetryTimer();
+      this.fsm.dispose();
     });
 
-    this.partialHiMode = this.platform.getGatePartialHiMode();
-    this.baseTopic = this.platform.normalizeTopicBase(this.context.topic);
-    this.reverseToggleDelayMs = this.platform.getGateReverseFollowUpDelayMs();
-    this.openArrivalDebounceMs = this.platform.getGateOpenAssumeDelayMs();
-    this.commandCooldownMs = this.platform.getGateCommandCooldownMs();
-    this.publishRetryDelayMs = this.platform.getGatePublishRetryDelayMs();
-    this.strictReverseDoublePulse = this.platform.getGateStrictReverseDoublePulse();
-    this.debugTimeline = this.platform.getGateDebugTimeline();
-
     this.platform.registerMqttHandler(
-      `${this.baseTopic}/state/hi`,
+      `${this.controlBaseTopic}/state/connected`,
       (message) => {
-        const previous = this.hasClosedSensorState ? this.isClosedSensorActive : undefined;
-        const next = this.platform.parseBoolean(message.toString());
-        const changed = !this.hasClosedSensorState || next !== this.isClosedSensorActive;
-        if (previous === true && next === false) {
-          this.lastClosedReleaseAt = Date.now();
-        } else if (next) {
-          this.lastClosedReleaseAt = 0;
-        }
-        this.isClosedSensorActive = next;
-        this.hasClosedSensorState = true;
-        this.updateStatesFromSensors({
-          closedPrevious: changed ? previous : undefined,
-        });
-      },
-      this.accessory.UUID,
-    );
-    this.platform.registerMqttHandler(
-      `${this.baseTopic}/state/partial_hi`,
-      (message) => {
-        const previous = this.hasPartialSensorState ? this.isPartialSensorActive : undefined;
-        const next = this.platform.parseBoolean(message.toString());
-        const changed = !this.hasPartialSensorState || next !== this.isPartialSensorActive;
-        if (previous === true && next === false) {
-          this.lastClosedReleaseAt = 0;
-        }
-        this.isPartialSensorActive = next;
-        this.hasPartialSensorState = true;
-        if (this.pendingTarget !== undefined && this.isPartialSensorActive) {
-          this.sawPartialMotionDuringPending = true;
-        }
-        this.updateStatesFromSensors({
-          partialPrevious: changed ? previous : undefined,
-        });
-      },
-      this.accessory.UUID,
-    );
-    this.platform.registerMqttHandler(
-      `${this.baseTopic}/state/connected`,
-      (message) => {
-        this.connected = this.platform.parseBoolean(message.toString());
-        this.updateStatusFault();
-        if (!this.connected) {
-          this.setPendingTarget(undefined);
-          this.clearTransitionTimer();
-          this.clearReverseToggleTimer();
-          this.clearOpenArrivalDebounceTimer();
-          this.clearPublishRetryTimer();
-        }
+        this.fsm.handleControlConnectedChange(this.platform.parseBoolean(message.toString()));
       },
       this.accessory.UUID,
     );
 
-    this.updateStatusFault();
+    this.platform.registerMqttHandler(
+      `${this.sensorBaseTopic}/state/connected`,
+      (message) => {
+        this.fsm.handleSensorConnectedChange(this.platform.parseBoolean(message.toString()));
+      },
+      this.accessory.UUID,
+    );
+
+    this.platform.registerMqttHandler(
+      `${this.sensorBaseTopic}/state/hi`,
+      (message) => {
+        this.fsm.handleClosedSensorChange(this.platform.parseBoolean(message.toString()));
+      },
+      this.accessory.UUID,
+    );
+
+    this.applySnapshot(this.fsm.getSnapshot());
   }
 
   async handleCurrentDoorStateGet(): Promise<CharacteristicValue> {
-    return this.currentState;
+    const snapshot = this.fsm.getSnapshot();
+    if (!snapshot.available || snapshot.currentDoorState === undefined) {
+      throw this.createCommunicationError();
+    }
+    return snapshot.currentDoorState;
   }
 
   async handleTargetDoorStateGet(): Promise<CharacteristicValue> {
-    return this.targetState;
+    const snapshot = this.fsm.getSnapshot();
+    if (!snapshot.available || snapshot.targetDoorState === undefined) {
+      throw this.createCommunicationError();
+    }
+    return snapshot.targetDoorState;
   }
 
   async handleTargetDoorStateSet(value: CharacteristicValue) {
-    const requestedTarget = value as number;
-    const mode = this.platform.getGateControlMode();
-    const motionTarget = this.getMotionTarget();
-    const isMoving = motionTarget !== undefined;
-    let target = requestedTarget;
-    this.logGateTimeline('set-request', {
-      requested: this.describeTargetState(requestedTarget),
-      motion: this.describeTargetState(motionTarget),
-      mode,
-    });
-    if (isMoving && motionTarget !== undefined && requestedTarget === motionTarget) {
-      if (this.isLikelyDuplicateSet(requestedTarget)) {
-        this.logGateTimeline('set-ignored-duplicate', {
-          requested: this.describeTargetState(requestedTarget),
-        });
-        return;
-      }
-      target = this.oppositeTarget(requestedTarget);
+    const target = Number(value) === DoorTargetState.OPEN ? 'open' : 'closed';
+    try {
+      await this.fsm.requestHomeKitTarget(target);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      this.platform.log.warn(`Gate ${this.accessory.displayName} command failed: ${message}`);
+      throw this.createCommunicationError();
     }
-    const previousTarget = this.targetState;
-    this.setTargetState(target);
-    this.clearReverseToggleTimer();
-    this.clearPublishRetryTimer();
-
-    if (!this.connected) {
-      this.platform.log.warn(`Gate ${this.accessory.displayName} is offline; ignoring command.`);
-      this.setTargetState(previousTarget);
-      this.updateStatusFault();
-      this.logGateTimeline('set-ignored-offline', {
-        requested: this.describeTargetState(requestedTarget),
-      });
-      return;
-    }
-
-    if (!isMoving && this.isAtTarget(target)) {
-      this.logGateTimeline('set-ignored-at-target', {
-        target: this.describeTargetState(target),
-      });
-      return;
-    }
-
-    if (this.pendingTarget === target) {
-      this.logGateTimeline('set-ignored-pending', {
-        target: this.describeTargetState(target),
-      });
-      return;
-    }
-
-    if (this.isCommandInCooldown(target, motionTarget)) {
-      this.setTargetState(previousTarget);
-      this.logGateTimeline('set-ignored-cooldown', {
-        target: this.describeTargetState(target),
-        cooldownMs: this.commandCooldownMs,
-      });
-      return;
-    }
-
-    let action = '';
-    if (mode === 'toggle') {
-      action = this.platform.getGateExecuteActionToggle();
-    } else {
-      action = target === this.platform.Characteristic.TargetDoorState.OPEN
-        ? this.platform.getGateExecuteActionOpen()
-        : this.platform.getGateExecuteActionClose();
-    }
-    if (!action) {
-      this.platform.log.warn(`Gate action not configured for ${this.accessory.displayName}`);
-      this.setTargetState(previousTarget);
-      return;
-    }
-    const isReversing = motionTarget !== undefined && motionTarget !== target;
-    this.publishGateAction(action, isReversing ? 'reverse' : undefined, target);
-    if (isReversing && this.shouldScheduleReverseFollowUp(mode)) {
-      this.scheduleReverseToggle(action, target, mode);
-    }
-
-    this.clearFaults();
-    this.setPendingTarget(target);
-    this.markCommand(target);
-    this.armTransitionTimer();
-    this.setCurrentState(this.resolveMovingState(target));
-    this.logGateTimeline('set-applied', {
-      action,
-      target: this.describeTargetState(target),
-      reversing: isReversing,
-    });
   }
 
   async handleObstructionDetectedGet(): Promise<CharacteristicValue> {
-    return this.obstructionDetected;
+    return false;
   }
 
-  private updateStatesFromSensors(context: SensorUpdateContext) {
-    const changed = (
-      (context.closedPrevious !== undefined && context.closedPrevious !== this.isClosedSensorActive)
-      || (context.partialPrevious !== undefined && context.partialPrevious !== this.isPartialSensorActive)
-    );
-    if (changed) {
-      this.logGateTimeline('sensor-change', {
-        closed: this.describeSensorValue(this.hasClosedSensorState, this.isClosedSensorActive),
-        partial: this.describeSensorValue(this.hasPartialSensorState, this.isPartialSensorActive),
+  private applySnapshot(snapshot: FrontGateSnapshot): void {
+    this.accessory.updateReachability(snapshot.available);
+
+    if (this.service.testCharacteristic(this.platform.Characteristic.StatusActive)) {
+      this.service.updateCharacteristic(this.platform.Characteristic.StatusActive, snapshot.available);
+    }
+    if (this.service.testCharacteristic(this.platform.Characteristic.StatusFault)) {
+      this.service.updateCharacteristic(
+        this.platform.Characteristic.StatusFault,
+        snapshot.available
+          ? this.platform.Characteristic.StatusFault.NO_FAULT
+          : this.platform.Characteristic.StatusFault.GENERAL_FAULT,
+      );
+    }
+
+    this.service.updateCharacteristic(this.platform.Characteristic.ObstructionDetected, false);
+
+    if (!snapshot.available || snapshot.currentDoorState === undefined || snapshot.targetDoorState === undefined) {
+      const error = this.createCommunicationError();
+      this.service.updateCharacteristic(this.platform.Characteristic.CurrentDoorState, error);
+      this.service.updateCharacteristic(this.platform.Characteristic.TargetDoorState, error);
+      return;
+    }
+
+    this.service.updateCharacteristic(this.platform.Characteristic.CurrentDoorState, snapshot.currentDoorState);
+    this.service.updateCharacteristic(this.platform.Characteristic.TargetDoorState, snapshot.targetDoorState);
+  }
+
+  private createCommunicationError(): Error {
+    return new Error('Front gate controller is unavailable');
+  }
+
+  private async publishPulse(reason: string): Promise<void> {
+    const action = this.platform.getFrontGatePulseAction();
+    if (!action) {
+      throw new Error('front gate pulse action is not configured');
+    }
+
+    this.platform.log.debug(`Publishing ${this.controlBaseTopic}/execute_action = ${action} (${reason})`);
+
+    return new Promise<void>((resolve, reject) => {
+      this.platform.publishCommand(`${this.controlBaseTopic}/execute_action`, action, (error) => {
+        if (error) {
+          reject(error);
+          return;
+        }
+        resolve();
       });
-    }
-    this.clearFaults();
-    if (changed) {
-      this.touchTransitionTimer();
-    }
-    if (this.isClosedSensorActive) {
-      if (this.pendingTarget === this.platform.Characteristic.TargetDoorState.OPEN) {
-        this.setTargetState(this.platform.Characteristic.TargetDoorState.OPEN);
-        this.setCurrentState(this.platform.Characteristic.CurrentDoorState.OPENING);
-        return;
-      }
-      this.setPendingTarget(undefined);
-      this.clearTransitionTimer();
-      this.clearReverseToggleTimer();
-      this.clearOpenArrivalDebounceTimer();
-      this.applyDoorState(
-        this.platform.Characteristic.CurrentDoorState.CLOSED,
-        this.platform.Characteristic.TargetDoorState.CLOSED,
-      );
-      return;
-    }
-
-    if (this.pendingTarget === this.platform.Characteristic.TargetDoorState.OPEN
-      && this.shouldDebounceOpenArrival()) {
-      this.scheduleOpenArrivalDebounce();
-      return;
-    }
-
-    if (this.pendingTarget === this.platform.Characteristic.TargetDoorState.OPEN
-      && this.isOpenArrivalSignal()) {
-      this.setPendingTarget(undefined);
-      this.clearTransitionTimer();
-      this.clearReverseToggleTimer();
-      this.clearOpenArrivalDebounceTimer();
-      this.applyDoorState(
-        this.platform.Characteristic.CurrentDoorState.OPEN,
-        this.platform.Characteristic.TargetDoorState.OPEN,
-      );
-      return;
-    }
-
-    if (this.pendingTarget !== undefined) {
-      this.setTargetState(this.pendingTarget);
-      this.setCurrentState(this.resolveMovingState(this.pendingTarget));
-      return;
-    }
-
-    if (this.shouldAssumeExternalOpeningFromClosed(context)) {
-      this.setPendingTarget(this.platform.Characteristic.TargetDoorState.OPEN);
-      this.setTargetState(this.platform.Characteristic.TargetDoorState.OPEN);
-      this.setCurrentState(this.platform.Characteristic.CurrentDoorState.OPENING);
-      this.armTransitionTimer();
-      this.scheduleOpenArrivalDebounce();
-      return;
-    }
-
-    const inferredExternalMotionTarget = this.resolveExternalMotionTarget(context);
-    if (inferredExternalMotionTarget !== undefined) {
-      this.clearTransitionTimer();
-      this.clearOpenArrivalDebounceTimer();
-      this.setTargetState(inferredExternalMotionTarget);
-      this.setCurrentState(this.resolveMovingState(inferredExternalMotionTarget));
-      return;
-    }
-
-    this.clearTransitionTimer();
-    this.clearReverseToggleTimer();
-    this.clearOpenArrivalDebounceTimer();
-    this.applyDoorState(
-      this.platform.Characteristic.CurrentDoorState.OPEN,
-      this.platform.Characteristic.TargetDoorState.OPEN,
-    );
+    });
   }
 
-  private isAtTarget(target: number): boolean {
-    if (target === this.platform.Characteristic.TargetDoorState.CLOSED) {
-      if (!this.hasClosedSensorState) {
+  private resolveSensorBaseTopic(): string {
+    const explicit = this.resolveSensorOverrideFromConfig();
+    if (explicit) {
+      this.platform.log.info(
+        `[FrontGate ${this.accessory.displayName}] using explicit front-gate sensor topic override: ${explicit}`,
+      );
+      return explicit;
+    }
+
+    const candidates = this.findSensorCandidates();
+    if (candidates.length === 0) {
+      this.platform.log.warn(
+        `[FrontGate ${this.accessory.displayName}] no dedicated gate sensor channel found; falling back to ${this.controlBaseTopic}/state/hi`,
+      );
+      return this.controlBaseTopic;
+    }
+
+    const winner = candidates[0];
+    this.platform.log.info(
+      `[FrontGate ${this.accessory.displayName}] resolved sensor channel ${winner.channel.channelCaption} `
+      + `(${winner.channel.deviceId}/${winner.channel.channelId}) -> ${winner.baseTopic} `
+      + `[${winner.reasons.join(', ')}]`,
+    );
+    return winner.baseTopic;
+  }
+
+  private resolveSensorOverrideFromConfig(): string | undefined {
+    const config = this.platform.config as unknown as FrontGateConfigView;
+
+    if (typeof config.frontGateSensorTopic === 'string' && config.frontGateSensorTopic.trim()) {
+      return this.platform.normalizeTopicBase(config.frontGateSensorTopic);
+    }
+
+    const requestedDeviceId = this.normalizeOptionalId(config.frontGateSensorDeviceId);
+    const requestedChannelId = this.normalizeOptionalId(config.frontGateSensorChannelId);
+    if (!requestedDeviceId && !requestedChannelId) {
+      return undefined;
+    }
+
+    const channel = this.collectKnownChannels().find(candidate => {
+      if (requestedDeviceId && candidate.deviceId !== requestedDeviceId) {
         return false;
       }
-      return this.isClosedSensorActive;
-    }
-    if (target === this.platform.Characteristic.TargetDoorState.OPEN) {
-      return this.isKnownNotClosed()
-        && this.currentState === this.platform.Characteristic.CurrentDoorState.OPEN;
-    }
-    return false;
-  }
-
-  private applyDoorState(current: number, target: number) {
-    this.setCurrentState(current);
-    this.setTargetState(target);
-  }
-
-  private setCurrentState(next: number) {
-    if (this.currentState === next) {
-      return;
-    }
-    this.currentState = next;
-    this.service.updateCharacteristic(this.platform.Characteristic.CurrentDoorState, this.currentState);
-  }
-
-  private setTargetState(next: number) {
-    if (this.targetState === next) {
-      return;
-    }
-    this.targetState = next;
-    this.service.updateCharacteristic(this.platform.Characteristic.TargetDoorState, this.targetState);
-  }
-
-  private isKnownNotClosed(): boolean {
-    if (this.hasClosedSensorState) {
-      return !this.isClosedSensorActive;
-    }
-    if (this.hasPartialSensorState && this.isPartialSensorActive) {
+      if (requestedChannelId && candidate.channelId !== requestedChannelId) {
+        return false;
+      }
       return true;
+    });
+
+    if (!channel) {
+      this.platform.log.warn(
+        `[FrontGate ${this.accessory.displayName}] configured frontGateSensorDeviceId/frontGateSensorChannelId did not match any known channel`,
+      );
+      return undefined;
     }
-    return this.currentState !== this.platform.Characteristic.CurrentDoorState.CLOSED;
+
+    return this.platform.normalizeTopicBase(channel.topic);
   }
 
-  private updateStatusFault() {
-    const fault = !this.connected;
-    this.service.updateCharacteristic(
-      this.platform.Characteristic.StatusFault,
-      fault
-        ? this.platform.Characteristic.StatusFault.GENERAL_FAULT
-        : this.platform.Characteristic.StatusFault.NO_FAULT,
+  private findSensorCandidates(): SensorCandidate[] {
+    const channels = this.collectKnownChannels();
+    const candidates: SensorCandidate[] = [];
+
+    for (const channel of channels) {
+      if (channel.channelId === this.context.channelId && channel.deviceId === this.context.deviceId) {
+        continue;
+      }
+
+      const score = this.scoreSensorCandidate(channel);
+      if (score.score <= 0) {
+        continue;
+      }
+
+      candidates.push({
+        channel,
+        baseTopic: this.platform.normalizeTopicBase(channel.topic),
+        score: score.score,
+        reasons: score.reasons,
+      });
+    }
+
+    candidates.sort((left, right) => right.score - left.score);
+    return candidates;
+  }
+
+  private scoreSensorCandidate(channel: SuplaChannelContext): { score: number; reasons: string[] } {
+    const reasons: string[] = [];
+    let score = 0;
+
+    const functionName = (channel.channelFunction || '').toUpperCase();
+    const typeName = (channel.channelType || '').toUpperCase();
+
+    const isGateSensorFunction = functionName === 'OPENINGSENSOR_GATE' || functionName === 'OPENINGSENSOR_GATEWAY';
+    const isGenericOpeningSensor = functionName.startsWith('OPENINGSENSOR_');
+    const isBinarySensor = typeName === 'BINARYSENSOR';
+    const sameDevice = Boolean(channel.deviceId && channel.deviceId === this.context.deviceId);
+    const captionScore = this.computeCaptionSimilarity(
+      this.context.channelCaption || this.accessory.displayName,
+      channel.channelCaption || '',
     );
-  }
 
-  private clearFaults() {
-    if (this.obstructionDetected) {
-      this.obstructionDetected = false;
-      this.service.updateCharacteristic(this.platform.Characteristic.ObstructionDetected, false);
-    }
-    this.updateStatusFault();
-  }
-
-  private armTransitionTimer() {
-    this.clearTransitionTimer();
-    this.transitionTimer = setTimeout(() => {
-      this.transitionTimer = undefined;
-      const target = this.pendingTarget;
-      this.setPendingTarget(undefined);
-      this.clearReverseToggleTimer();
-      this.clearOpenArrivalDebounceTimer();
-      if (target === undefined) {
-        return;
+    if (isGateSensorFunction) {
+      score += 100;
+      reasons.push('gate-sensor-function');
+    } else if (isGenericOpeningSensor) {
+      score += 70;
+      reasons.push('opening-sensor-function');
+    } else if (isBinarySensor) {
+      if (!sameDevice && captionScore === 0) {
+        return { score: 0, reasons: [] };
       }
-      const settled = this.resolveTerminalStateFromSensors();
-      if (settled !== undefined) {
-        this.applyDoorState(settled.current, settled.target);
-        return;
+      score += 20;
+      reasons.push('binary-sensor');
+    } else {
+      return { score: 0, reasons: [] };
+    }
+
+    if (sameDevice) {
+      score += 50;
+      reasons.push('same-device');
+    }
+
+    if (captionScore > 0) {
+      score += captionScore;
+      reasons.push(`caption+${captionScore}`);
+    }
+
+    const controlBase = this.platform.normalizeTopicBase(this.context.topic);
+    const candidateBase = this.platform.normalizeTopicBase(channel.topic);
+    if (controlBase && candidateBase && controlBase !== candidateBase) {
+      const controlPrefix = controlBase.replace(/\/channels\/[^/]+$/, '');
+      const candidatePrefix = candidateBase.replace(/\/channels\/[^/]+$/, '');
+      if (controlPrefix === candidatePrefix) {
+        score += 15;
+        reasons.push('same-device-topic-prefix');
       }
-      const assumedCurrent = target === this.platform.Characteristic.TargetDoorState.OPEN
-        ? this.platform.Characteristic.CurrentDoorState.OPEN
-        : this.platform.Characteristic.CurrentDoorState.CLOSED;
-      this.applyDoorState(assumedCurrent, target);
-      this.platform.log.warn(
-        `Gate ${this.accessory.displayName} did not confirm target within ${this.transitionTimeoutMs}ms; assuming ` +
-        `${target === this.platform.Characteristic.TargetDoorState.OPEN ? 'open' : 'closed'}.`,
-      );
-      this.logGateTimeline('transition-timeout-assumed', {
-        assumedTarget: this.describeTargetState(target),
-      });
-    }, this.transitionTimeoutMs);
+    }
+
+    return { score, reasons };
   }
 
-  private clearTransitionTimer() {
-    if (this.transitionTimer) {
-      clearTimeout(this.transitionTimer);
-      this.transitionTimer = undefined;
-    }
-  }
+  private computeCaptionSimilarity(left: string, right: string): number {
+    const leftTokens = this.tokenizeCaption(left);
+    const rightTokens = this.tokenizeCaption(right);
 
-  private clearReverseToggleTimer() {
-    if (this.reverseToggleTimer) {
-      clearTimeout(this.reverseToggleTimer);
-      this.reverseToggleTimer = undefined;
+    if (leftTokens.length === 0 || rightTokens.length === 0) {
+      return 0;
     }
-  }
 
-  private clearOpenArrivalDebounceTimer() {
-    if (this.openArrivalDebounceTimer) {
-      clearTimeout(this.openArrivalDebounceTimer);
-      this.openArrivalDebounceTimer = undefined;
-    }
-  }
-
-  private clearPublishRetryTimer() {
-    if (this.publishRetryTimer) {
-      clearTimeout(this.publishRetryTimer);
-      this.publishRetryTimer = undefined;
-    }
-  }
-
-  private touchTransitionTimer() {
-    if (this.pendingTarget === undefined) {
-      return;
-    }
-    this.armTransitionTimer();
-  }
-
-  private resolveMovingState(target: number): number {
-    if (target === this.platform.Characteristic.TargetDoorState.OPEN) {
-      return this.platform.Characteristic.CurrentDoorState.OPENING;
-    }
-    if (target === this.platform.Characteristic.TargetDoorState.CLOSED) {
-      return this.platform.Characteristic.CurrentDoorState.CLOSING;
-    }
-    return this.currentState;
-  }
-
-  private getMotionTarget(): number | undefined {
-    if (this.pendingTarget !== undefined) {
-      return this.pendingTarget;
-    }
-    if (this.currentState === this.platform.Characteristic.CurrentDoorState.OPENING) {
-      return this.platform.Characteristic.TargetDoorState.OPEN;
-    }
-    if (this.currentState === this.platform.Characteristic.CurrentDoorState.CLOSING) {
-      return this.platform.Characteristic.TargetDoorState.CLOSED;
-    }
-    return undefined;
-  }
-
-  private isOpenArrivalSignal(): boolean {
-    if (this.partialHiMode === 'moving') {
-      if (!this.hasPartialSensorState) {
-        return true;
+    const rightSet = new Set(rightTokens);
+    let overlap = 0;
+    for (const token of leftTokens) {
+      if (rightSet.has(token)) {
+        overlap += 1;
       }
-      return this.hasPartialSensorState
-        && this.sawPartialMotionDuringPending
-        && !this.isPartialSensorActive;
     }
-    if (!this.hasPartialSensorState) {
-      return false;
+
+    if (overlap === 0) {
+      return 0;
     }
-    if (this.partialHiMode === 'open_endstop') {
-      return this.isPartialSensorActive;
-    }
-    if (this.partialHiMode === 'pedestrian_endstop') {
-      return this.isPartialSensorActive;
-    }
-    return false;
+
+    return Math.min(40, overlap * 10);
   }
 
-  private shouldDebounceOpenArrival(): boolean {
-    if (this.isClosedSensorActive) {
-      return false;
-    }
-    if (this.partialHiMode === 'ignore') {
-      return true;
-    }
-    return this.partialHiMode === 'moving' && !this.hasPartialSensorState;
+  private tokenizeCaption(value: string): string[] {
+    return value
+      .toLowerCase()
+      .normalize('NFD')
+      .replace(/[\u0300-\u036f]/g, '')
+      .split(/[^a-z0-9]+/)
+      .filter(Boolean)
+      .filter(token => !new Set([
+        'gate',
+        'sensor',
+        'contact',
+        'opening',
+        'open',
+        'close',
+        'controller',
+      ]).has(token));
   }
 
-  private shouldAssumeExternalOpeningFromClosed(context: SensorUpdateContext): boolean {
-    return context.closedPrevious === true
-      && !this.isClosedSensorActive
-      && this.shouldDebounceOpenArrival();
-  }
-
-  private scheduleOpenArrivalDebounce() {
-    if (this.openArrivalDebounceTimer) {
-      return;
-    }
-    this.openArrivalDebounceTimer = setTimeout(() => {
-      this.openArrivalDebounceTimer = undefined;
-      if (!this.connected) {
-        return;
-      }
-      if (this.pendingTarget !== this.platform.Characteristic.TargetDoorState.OPEN) {
-        return;
-      }
-      if (this.isClosedSensorActive) {
-        return;
-      }
-      this.setPendingTarget(undefined);
-      this.clearTransitionTimer();
-      this.clearReverseToggleTimer();
-      this.applyDoorState(
-        this.platform.Characteristic.CurrentDoorState.OPEN,
-        this.platform.Characteristic.TargetDoorState.OPEN,
-      );
-      this.logGateTimeline('open-assumed-arrival', {
-        debounceMs: this.openArrivalDebounceMs,
-      });
-    }, this.openArrivalDebounceMs);
-  }
-
-  private resolveTerminalStateFromSensors():
-  {current: number; target: number} | undefined {
-    if (!this.hasClosedSensorState) {
+  private normalizeOptionalId(value: string | number | undefined): string | undefined {
+    if (value === undefined || value === null) {
       return undefined;
     }
-    if (this.isClosedSensorActive) {
-      return {
-        current: this.platform.Characteristic.CurrentDoorState.CLOSED,
-        target: this.platform.Characteristic.TargetDoorState.CLOSED,
-      };
-    }
-    return {
-      current: this.platform.Characteristic.CurrentDoorState.OPEN,
-      target: this.platform.Characteristic.TargetDoorState.OPEN,
+    const normalized = String(value).trim();
+    return normalized || undefined;
+  }
+
+  private collectKnownChannels(): SuplaChannelContext[] {
+    const byKey = new Map<string, SuplaChannelContext>();
+    const push = (candidate: unknown) => {
+      if (!candidate || typeof candidate !== 'object') {
+        return;
+      }
+
+      const channel = candidate as Partial<SuplaChannelContext>;
+      if (typeof channel.topic !== 'string') {
+        return;
+      }
+
+      const key = [
+        channel.deviceId ?? '',
+        channel.channelId ?? '',
+        this.platform.normalizeTopicBase(channel.topic),
+      ].join('|');
+
+      byKey.set(key, channel as SuplaChannelContext);
     };
-  }
 
-  private oppositeTarget(target: number): number {
-    return target === this.platform.Characteristic.TargetDoorState.OPEN
-      ? this.platform.Characteristic.TargetDoorState.CLOSED
-      : this.platform.Characteristic.TargetDoorState.OPEN;
-  }
-
-  private markCommand(target: number) {
-    this.lastCommandTarget = target;
-    this.lastCommandAt = Date.now();
-  }
-
-  private setPendingTarget(target: number | undefined) {
-    this.pendingTarget = target;
-    if (target !== this.platform.Characteristic.TargetDoorState.OPEN) {
-      this.clearOpenArrivalDebounceTimer();
+    for (const knownAccessory of this.platform.accessories) {
+      push(knownAccessory.context.device);
     }
-    if (target === undefined) {
-      this.sawPartialMotionDuringPending = false;
-      return;
-    }
-    this.sawPartialMotionDuringPending = this.hasPartialSensorState && this.isPartialSensorActive;
-  }
 
-  private isLikelyDuplicateSet(target: number): boolean {
-    if (this.lastCommandTarget !== target) {
-      return false;
-    }
-    return Date.now() - this.lastCommandAt <= this.duplicateSetWindowMs;
-  }
-
-  private publishGateAction(action: string, note?: string, expectedTarget?: number, isRetry = false) {
-    const suffix = note ? ` (${note})` : '';
-    this.platform.log.debug(`Publishing ${this.baseTopic}/execute_action = ${action}${suffix}`);
-    this.logGateTimeline(isRetry ? 'publish-retry' : 'publish', {
-      action,
-      note: note ?? 'none',
-      expected: this.describeTargetState(expectedTarget),
-    });
-    this.platform.publishCommand(`${this.baseTopic}/execute_action`, action, (error) => {
-      if (!error) {
-        return;
+    const config = this.platform.config as unknown as FrontGateConfigView;
+    const rawChannels = config.channels;
+    if (Array.isArray(rawChannels)) {
+      for (const channel of rawChannels) {
+        push(channel);
       }
-      this.platform.log.warn(
-        `Gate ${this.accessory.displayName} publish failed (${action}): ${error.message}`,
-      );
-      this.logGateTimeline('publish-failed', {
-        action,
-        retry: !isRetry && this.publishRetryDelayMs > 0,
-      });
-      if (isRetry || this.publishRetryDelayMs <= 0) {
-        return;
+    } else if (typeof rawChannels === 'string' && rawChannels.trim()) {
+      try {
+        const parsed = JSON.parse(rawChannels);
+        if (Array.isArray(parsed)) {
+          for (const channel of parsed) {
+            push(channel);
+          }
+        }
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        this.platform.log.warn(`[FrontGate ${this.accessory.displayName}] failed to parse cached channels: ${message}`);
       }
-      this.schedulePublishRetry(action, note, expectedTarget);
-    });
-  }
-
-  private schedulePublishRetry(action: string, note?: string, expectedTarget?: number) {
-    this.clearPublishRetryTimer();
-    this.publishRetryTimer = setTimeout(() => {
-      this.publishRetryTimer = undefined;
-      if (!this.connected) {
-        return;
-      }
-      if (expectedTarget !== undefined && this.pendingTarget !== expectedTarget) {
-        return;
-      }
-      this.publishGateAction(action, note, expectedTarget, true);
-    }, this.publishRetryDelayMs);
-    this.logGateTimeline('publish-retry-scheduled', {
-      action,
-      retryDelayMs: this.publishRetryDelayMs,
-      expected: this.describeTargetState(expectedTarget),
-    });
-  }
-
-  private scheduleReverseToggle(
-    action: string,
-    expectedTarget: number,
-    mode: 'execute_action' | 'toggle',
-  ) {
-    this.clearReverseToggleTimer();
-    this.reverseToggleTimer = setTimeout(() => {
-      this.reverseToggleTimer = undefined;
-      if (!this.connected) {
-        return;
-      }
-      if (this.pendingTarget !== expectedTarget) {
-        return;
-      }
-      if (!this.strictReverseDoublePulse
-        && mode === 'execute_action'
-        && this.isOpenCloseExecuteActionPair()
-        && !this.shouldPublishExecuteActionReverseFollowUp()) {
-        this.logGateTimeline('reverse-2-skipped', {
-          reason: 'motion-confirmed',
-          strict: this.strictReverseDoublePulse,
-        });
-        return;
-      }
-      this.publishGateAction(action, 'reverse-2', expectedTarget);
-    }, this.reverseToggleDelayMs);
-    this.logGateTimeline('reverse-2-scheduled', {
-      action,
-      mode,
-      delayMs: this.reverseToggleDelayMs,
-      expected: this.describeTargetState(expectedTarget),
-    });
-  }
-
-  private shouldScheduleReverseFollowUp(mode: 'execute_action' | 'toggle'): boolean {
-    if (mode === 'toggle') {
-      return true;
-    }
-    return this.isOpenCloseExecuteActionPair() || this.isSingleExecuteActionPair();
-  }
-
-  private isOpenCloseExecuteActionPair(): boolean {
-    return this.normalizeAction(this.platform.getGateExecuteActionOpen()) === 'open'
-      && this.normalizeAction(this.platform.getGateExecuteActionClose()) === 'close';
-  }
-
-  private isSingleExecuteActionPair(): boolean {
-    const openAction = this.normalizeAction(this.platform.getGateExecuteActionOpen());
-    if (!openAction) {
-      return false;
-    }
-    return openAction === this.normalizeAction(this.platform.getGateExecuteActionClose());
-  }
-
-  private normalizeAction(value: string): string {
-    return value.trim().toLowerCase();
-  }
-
-  private shouldPublishExecuteActionReverseFollowUp(): boolean {
-    if (this.partialHiMode !== 'moving') {
-      return true;
-    }
-    if (!this.hasPartialSensorState) {
-      return true;
-    }
-    return !this.isPartialSensorActive;
-  }
-
-  private resolveExternalMotionTarget(context: SensorUpdateContext): number | undefined {
-    if (this.partialHiMode !== 'moving') {
-      return undefined;
-    }
-    if (!this.hasPartialSensorState || !this.isPartialSensorActive) {
-      return undefined;
-    }
-    if (this.hasClosedSensorState && this.isClosedSensorActive) {
-      return undefined;
     }
 
-    const closedJustOpened = context.closedPrevious !== undefined
-      && context.closedPrevious
-      && !this.isClosedSensorActive;
-    if (closedJustOpened) {
-      return this.platform.Characteristic.TargetDoorState.OPEN;
-    }
-    if (this.wasClosedReleasedRecently()) {
-      return this.platform.Characteristic.TargetDoorState.OPEN;
-    }
-
-    const existingMotionTarget = this.getMotionTarget();
-    if (existingMotionTarget !== undefined) {
-      return existingMotionTarget;
-    }
-
-    if (this.currentState === this.platform.Characteristic.CurrentDoorState.CLOSED) {
-      return this.platform.Characteristic.TargetDoorState.OPEN;
-    }
-    if (this.currentState === this.platform.Characteristic.CurrentDoorState.OPEN) {
-      return this.platform.Characteristic.TargetDoorState.CLOSED;
-    }
-
-    return this.targetState === this.platform.Characteristic.TargetDoorState.OPEN
-      ? this.platform.Characteristic.TargetDoorState.CLOSED
-      : this.platform.Characteristic.TargetDoorState.OPEN;
-  }
-
-  private wasClosedReleasedRecently(): boolean {
-    if (!this.lastClosedReleaseAt) {
-      return false;
-    }
-    return Date.now() - this.lastClosedReleaseAt <= this.externalDirectionHintWindowMs;
-  }
-
-  private isCommandInCooldown(target: number, motionTarget: number | undefined): boolean {
-    if (this.commandCooldownMs <= 0 || this.lastCommandAt === 0) {
-      return false;
-    }
-    if (Date.now() - this.lastCommandAt > this.commandCooldownMs) {
-      return false;
-    }
-    const isReverse = motionTarget !== undefined && motionTarget !== target;
-    return !isReverse;
-  }
-
-  private describeTargetState(value: number | undefined): string {
-    if (value === undefined) {
-      return 'none';
-    }
-    if (value === this.platform.Characteristic.TargetDoorState.OPEN) {
-      return 'open';
-    }
-    if (value === this.platform.Characteristic.TargetDoorState.CLOSED) {
-      return 'closed';
-    }
-    return `unknown(${value})`;
-  }
-
-  private describeCurrentState(value: number): string {
-    if (value === this.platform.Characteristic.CurrentDoorState.OPEN) {
-      return 'open';
-    }
-    if (value === this.platform.Characteristic.CurrentDoorState.CLOSED) {
-      return 'closed';
-    }
-    if (value === this.platform.Characteristic.CurrentDoorState.OPENING) {
-      return 'opening';
-    }
-    if (value === this.platform.Characteristic.CurrentDoorState.CLOSING) {
-      return 'closing';
-    }
-    if (value === this.platform.Characteristic.CurrentDoorState.STOPPED) {
-      return 'stopped';
-    }
-    return `unknown(${value})`;
-  }
-
-  private describeSensorValue(hasValue: boolean, value: boolean): string {
-    if (!hasValue) {
-      return 'unknown';
-    }
-    return value ? 'true' : 'false';
-  }
-
-  private logGateTimeline(event: string, context?: Record<string, unknown>) {
-    if (!this.debugTimeline) {
-      return;
-    }
-    const snapshot: Record<string, unknown> = {
-      event,
-      current: this.describeCurrentState(this.currentState),
-      target: this.describeTargetState(this.targetState),
-      pending: this.describeTargetState(this.pendingTarget),
-      connected: this.connected,
-      closed: this.describeSensorValue(this.hasClosedSensorState, this.isClosedSensorActive),
-      partial: this.describeSensorValue(this.hasPartialSensorState, this.isPartialSensorActive),
-    };
-    const merged = {
-      ...snapshot,
-      ...context,
-    };
-    const details = Object.entries(merged)
-      .map(([key, value]) => `${key}=${String(value)}`)
-      .join(' ');
-    this.platform.log.info(`[GateDebug ${this.accessory.displayName}] ${details}`);
+    return Array.from(byKey.values());
   }
 }
