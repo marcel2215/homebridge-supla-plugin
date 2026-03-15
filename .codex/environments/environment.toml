@@ -24,3 +24,8 @@ command = "npm run version:bump:revision"
 name = "Publish"
 icon = "tool"
 command = "npm run publish:plugin"
+
+[[actions]]
+name = "Login"
+icon = "tool"
+command = "npm login"
