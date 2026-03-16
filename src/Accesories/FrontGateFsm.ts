@@ -566,8 +566,8 @@ export class FrontGateFsm {
 
     if (this.plan.direction === 'opening') {
       // Fully-open and partially-open look the same to us. When the opening
-      // window expires we intentionally collapse to the generic open-ish state,
-      // which the Home app will still display as "Opening" per the requested UX.
+      // window expires we intentionally collapse to the generic open-ish state
+      // and report it as OPEN unless the closed end-stop says otherwise.
       this.clearTimers();
       this.plan = { kind: 'idle' };
       this.requestedTarget = null;
@@ -674,7 +674,7 @@ export class FrontGateFsm {
       return this.plan.finalDirection === 'closing' ? DoorCurrentState.CLOSING : DoorCurrentState.OPENING;
     }
 
-    return this.facts.closedSensor ? DoorCurrentState.CLOSED : DoorCurrentState.OPENING;
+    return this.facts.closedSensor ? DoorCurrentState.CLOSED : DoorCurrentState.OPEN;
   }
 
   private computeTargetDoorState(): DoorTargetState {
