@@ -26,6 +26,9 @@ export class GateAccessory {
   private readonly controlBaseTopic: string;
   private readonly sensorBaseTopic: string;
   private readonly fsm: FrontGateFsm;
+  private pendingSelfCommandEchoCount = 0;
+  private pendingSelfCommandEchoPayload?: string;
+  private pendingSelfCommandEchoExpiresAt = 0;
 
   constructor(
     private readonly platform: SuplaPlatform,
@@ -103,6 +106,18 @@ export class GateAccessory {
       this.accessory.UUID,
     );
 
+    this.platform.registerMqttHandler(
+      `${this.controlBaseTopic}/execute_action`,
+      (message) => {
+        const payload = message.toString();
+        if (this.shouldIgnoreObservedExecuteAction(payload)) {
+          return;
+        }
+        this.fsm.handleObservedExternalPulse(`mqtt-execute_action:${payload}`);
+      },
+      this.accessory.UUID,
+    );
+
     this.applySnapshot(this.fsm.getSnapshot());
   }
 
@@ -176,16 +191,67 @@ export class GateAccessory {
     }
 
     this.platform.log.debug(`Publishing ${this.controlBaseTopic}/execute_action = ${action} (${reason})`);
+    this.noteExpectedSelfCommandEcho(action);
 
     return new Promise<void>((resolve, reject) => {
       this.platform.publishCommand(`${this.controlBaseTopic}/execute_action`, action, (error) => {
         if (error) {
+          this.retractExpectedSelfCommandEcho(action);
           reject(error);
           return;
         }
         resolve();
       });
     });
+  }
+
+  private noteExpectedSelfCommandEcho(payload: string): void {
+    this.prunePendingSelfCommandEcho();
+    this.pendingSelfCommandEchoPayload = payload;
+    this.pendingSelfCommandEchoCount += 1;
+    this.pendingSelfCommandEchoExpiresAt = Date.now() + 2000;
+  }
+
+  private retractExpectedSelfCommandEcho(payload: string): void {
+    this.prunePendingSelfCommandEcho();
+    if (this.pendingSelfCommandEchoPayload !== payload || this.pendingSelfCommandEchoCount <= 0) {
+      return;
+    }
+
+    this.pendingSelfCommandEchoCount -= 1;
+    if (this.pendingSelfCommandEchoCount <= 0) {
+      this.pendingSelfCommandEchoCount = 0;
+      this.pendingSelfCommandEchoPayload = undefined;
+      this.pendingSelfCommandEchoExpiresAt = 0;
+    }
+  }
+
+  private shouldIgnoreObservedExecuteAction(payload: string): boolean {
+    this.prunePendingSelfCommandEcho();
+    if (this.pendingSelfCommandEchoPayload !== payload || this.pendingSelfCommandEchoCount <= 0) {
+      return false;
+    }
+
+    this.pendingSelfCommandEchoCount -= 1;
+    if (this.pendingSelfCommandEchoCount <= 0) {
+      this.pendingSelfCommandEchoCount = 0;
+      this.pendingSelfCommandEchoPayload = undefined;
+      this.pendingSelfCommandEchoExpiresAt = 0;
+    }
+    return true;
+  }
+
+  private prunePendingSelfCommandEcho(): void {
+    if (this.pendingSelfCommandEchoCount === 0) {
+      return;
+    }
+    if (Date.now() <= this.pendingSelfCommandEchoExpiresAt) {
+      return;
+    }
+
+    this.pendingSelfCommandEchoCount = 0;
+    this.pendingSelfCommandEchoPayload = undefined;
+    this.pendingSelfCommandEchoExpiresAt = 0;
   }
 
   private resolveSensorBaseTopic(): string {

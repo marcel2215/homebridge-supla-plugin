@@ -2,6 +2,8 @@ export type GateTarget = 'open' | 'closed';
 export type MotionDirection = 'opening' | 'closing';
 export type MotionCertainty = 'known' | 'goalOnly';
 export type MotionSource = 'homekit' | 'external' | 'recovery';
+export type IdleNotClosedMode = 'openKnown' | 'openishUnknown';
+export type NextPulseDirection = MotionDirection | 'unknown';
 
 export const enum DoorCurrentState {
   OPEN = 0,
@@ -29,13 +31,13 @@ export const DEFAULT_FRONT_GATE_TIMINGS: FrontGateTimingConfig = {
   reversePauseMs: 3000,
   wrongDirectionRunMs: 0,
   minimumPulseGapMs: 3000,
-  closeRetryLimit: 1,
+  closeRetryLimit: 0,
 };
 
 export interface PersistedFrontGateState {
   // Intentionally empty.
   // The front gate controller does NOT persist motion/direction state because
-  // external control (Supla app / IR remote) can invalidate it at any time.
+  // Supla app / IR remote / HomeKit can invalidate it at any time.
 }
 
 export interface FrontGateSnapshot {
@@ -50,6 +52,8 @@ export interface FrontGateSnapshot {
   motionDirection: MotionDirection | 'none';
   motionCertainty: MotionCertainty | 'none';
   planKind: Plan['kind'];
+  idleNotClosedMode: IdleNotClosedMode;
+  nextPulseDirection: NextPulseDirection;
   note: string;
 }
 
@@ -72,15 +76,14 @@ type Plan =
       direction: MotionDirection;
       certainty: MotionCertainty;
       source: MotionSource;
-      attempt: number;
       startedAt: number;
       deadlineAt: number;
     }
   | {
       kind: 'waitingSecondPulse';
+      stoppedFrom: MotionDirection;
       finalDirection: MotionDirection;
       source: MotionSource;
-      attempt: number;
       dueAt: number;
       deadlineAt: number;
       reason: 'reverseToOpen' | 'reverseToClose';
@@ -97,10 +100,13 @@ function clampInt(value: number, min: number, max: number): number {
   return Math.min(max, Math.max(min, Math.round(value)));
 }
 
+function oppositeDirection(direction: MotionDirection): MotionDirection {
+  return direction === 'opening' ? 'closing' : 'opening';
+}
+
 export class FrontGateFsm {
   private readonly travelMs: number;
   private readonly pulseGapMs: number;
-  private readonly closeRetryLimit: number;
 
   private facts: {
     controlConnected: boolean | null;
@@ -114,6 +120,8 @@ export class FrontGateFsm {
 
   private sensorFreshSinceOnline = false;
   private requestedTarget: GateTarget | null = null;
+  private idleNotClosedMode: IdleNotClosedMode = 'openishUnknown';
+  private idleNextPulseDirection: NextPulseDirection = 'unknown';
   private plan: Plan = { kind: 'idle' };
   private lastPulseLikeActivityAt = 0;
   private movementTimer?: ReturnType<typeof setTimeout>;
@@ -134,7 +142,6 @@ export class FrontGateFsm {
       clampInt(timings.minimumPulseGapMs || DEFAULT_FRONT_GATE_TIMINGS.minimumPulseGapMs, 0, 15000),
       clampInt(timings.reversePauseMs || DEFAULT_FRONT_GATE_TIMINGS.reversePauseMs, 0, 15000),
     );
-    this.closeRetryLimit = clampInt(timings.closeRetryLimit || DEFAULT_FRONT_GATE_TIMINGS.closeRetryLimit, 0, 3);
 
     this.emitSnapshot('fsm-initialized');
   }
@@ -163,6 +170,12 @@ export class FrontGateFsm {
   public handleClosedSensorChange(closed: boolean): void {
     void this.enqueue(`closed-sensor=${closed}`, () => {
       this.applyClosedSensorChange(closed);
+    });
+  }
+
+  public handleObservedExternalPulse(reason = 'mqtt-execute_action'): void {
+    void this.enqueue(`external-pulse=${reason}`, () => {
+      this.applyObservedExternalPulse(reason);
     });
   }
 
@@ -254,6 +267,8 @@ export class FrontGateFsm {
       this.io.log.info('closed sensor is TRUE -> gate is fully closed');
       this.clearTimers();
       this.plan = { kind: 'idle' };
+      this.idleNextPulseDirection = 'opening';
+      this.idleNotClosedMode = 'openishUnknown';
 
       if (this.requestedTarget === 'open' && this.isAvailableForHomeKit()) {
         this.emitSnapshot('closed-sensor-true-but-open-still-requested');
@@ -271,9 +286,12 @@ export class FrontGateFsm {
     this.io.log.info('closed sensor is FALSE -> gate is not fully closed');
 
     if (previous === true) {
-      // The gate just left the closed end-stop. This is the one fully reliable
-      // direction signal we have: motion is opening.
+      // Leaving the closed end-stop is the one fully reliable motion signal we have:
+      // the gate is opening.
       this.lastPulseLikeActivityAt = Date.now();
+      if (this.requestedTarget !== 'open') {
+        this.requestedTarget = null;
+      }
       this.startOpeningMotion(
         this.requestedTarget === 'open' ? 'homekit' : 'external',
         'closed-sensor-fell-from-true-to-false',
@@ -281,9 +299,7 @@ export class FrontGateFsm {
       return;
     }
 
-    if (this.requestedTarget === 'open'
-      && !(this.plan.kind === 'moving' && this.plan.direction === 'closing')
-      && !(this.plan.kind === 'waitingSecondPulse' && this.plan.finalDirection === 'closing')) {
+    if (this.plan.kind === 'idle' && this.requestedTarget === 'open') {
       this.requestedTarget = null;
     }
 
@@ -320,31 +336,47 @@ export class FrontGateFsm {
       return;
     }
 
-    if (this.plan.kind === 'moving' && this.plan.direction === 'closing' && this.plan.certainty === 'known') {
-      await this.reverseKnownMotion('opening', 'homekit-reverse-known-closing-to-open');
-      return;
-    }
+    if (this.plan.kind === 'moving') {
+      if (this.plan.direction === 'opening') {
+        this.emitSnapshot('open-request-already-opening');
+        return;
+      }
 
-    if (this.plan.kind === 'waitingSecondPulse' && this.plan.finalDirection === 'closing') {
-      this.io.log.info('open requested while waiting to restart towards close; cancelling close restart');
-      this.clearPhaseTimer();
-      this.plan = { kind: 'idle' };
-      this.emitSnapshot('cancelled-pending-close-restart');
-      return;
-    }
+      if (this.plan.certainty === 'known') {
+        await this.reverseKnownMotion('opening', 'homekit-reverse-known-closing-to-open');
+        return;
+      }
 
-    if (this.plan.kind === 'moving' && this.plan.direction === 'closing' && this.plan.certainty === 'goalOnly') {
-      // We do not actually know whether the gate is currently closing or whether a
-      // previous close-seek pulse accidentally caused opening. In this ambiguous
-      // state, the safest action is to cancel further close retries and hold the
-      // gate in the generic open-ish state.
       this.io.log.warn(
-        'open requested during ambiguous close-seek; cancelling close retries instead of sending more pulses',
+        'open requested during ambiguous close attempt; not sending more pulses because the actual motion direction is unknown',
       );
       this.clearTimers();
       this.plan = { kind: 'idle' };
+      this.idleNotClosedMode = 'openishUnknown';
+      this.idleNextPulseDirection = 'unknown';
       this.requestedTarget = null;
-      this.emitSnapshot('cancelled-ambiguous-close-seek');
+      this.emitSnapshot('open-request-during-ambiguous-close-attempt');
+      return;
+    }
+
+    if (this.plan.kind === 'waitingSecondPulse') {
+      if (this.plan.finalDirection === 'opening') {
+        this.emitSnapshot('open-request-already-reversing-to-open');
+        return;
+      }
+
+      // We already stopped an opening run, so the next pulse can only start closing.
+      // To honor the latest OPEN request without leaving the gate stopped in the middle,
+      // keep the pending close, let the gate reach the closed end-stop, then auto-open.
+      this.io.log.info(
+        'open requested while waiting to restart towards close; keeping the pending close and will auto-open from closed',
+      );
+      this.emitSnapshot('open-request-deferred-until-closed');
+      return;
+    }
+
+    if (this.idleNextPulseDirection === 'opening') {
+      await this.startOpeningFromStoppedState('homekit-open-from-stopped-after-closing');
       return;
     }
 
@@ -355,11 +387,12 @@ export class FrontGateFsm {
   private async handleCloseRequest(): Promise<void> {
     if (this.facts.closedSensor === true) {
       if (this.plan.kind === 'moving' && this.plan.direction === 'opening') {
-        // A very early cancel while we are still on the closed end-stop can be
-        // satisfied by one pulse: stop the opening attempt and remain closed.
+        // We are still physically on the closed end-stop, so a single pulse cleanly
+        // cancels the opening attempt and leaves the gate closed.
         await this.pulseMotor('cancel-opening-while-still-closed');
         this.clearTimers();
         this.plan = { kind: 'idle' };
+        this.idleNextPulseDirection = 'opening';
         this.requestedTarget = null;
         this.emitSnapshot('opening-cancelled-before-leaving-closed');
         return;
@@ -370,30 +403,49 @@ export class FrontGateFsm {
       return;
     }
 
-    if (this.plan.kind === 'moving' && this.plan.direction === 'opening' && this.plan.certainty === 'known') {
+    if (this.plan.kind === 'moving') {
+      if (this.plan.direction === 'closing') {
+        this.emitSnapshot(
+          this.plan.certainty === 'known' ? 'close-request-already-closing' : 'close-request-already-close-seeking',
+        );
+        return;
+      }
+
       await this.reverseKnownMotion('closing', 'homekit-reverse-known-opening-to-close');
       return;
     }
 
-    if (this.plan.kind === 'waitingSecondPulse' && this.plan.finalDirection === 'opening') {
-      this.io.log.info('close requested while waiting to restart towards open; cancelling open restart');
-      this.clearPhaseTimer();
-      this.plan = { kind: 'idle' };
-      await this.startCloseSeek(0, 'close-after-cancelled-open-restart');
+    if (this.plan.kind === 'waitingSecondPulse') {
+      if (this.plan.finalDirection === 'closing') {
+        this.emitSnapshot('close-request-already-reversing-to-close');
+        return;
+      }
+
+      // We already stopped a closing run, so the next pulse can only start opening.
+      // To honor the latest CLOSE request without leaving the gate stopped in the middle,
+      // keep the pending open, let the gate become fully open-ish by timeout, then auto-close.
+      this.io.log.info(
+        'close requested while waiting to restart towards open; keeping the pending open and will auto-close after the opening run settles',
+      );
+      this.emitSnapshot('close-request-deferred-until-open');
       return;
     }
 
-    if (this.plan.kind === 'waitingSecondPulse' && this.plan.finalDirection === 'closing') {
-      this.emitSnapshot('close-request-already-reversing-to-close');
+    if (this.idleNotClosedMode === 'openKnown' || this.idleNextPulseDirection === 'closing') {
+      await this.startKnownCloseFromIdle('homekit-close-from-openish-known');
       return;
     }
 
-    if (this.plan.kind === 'moving' && this.plan.direction === 'closing') {
-      this.emitSnapshot('close-request-already-closing');
+    if (this.idleNextPulseDirection === 'opening') {
+      this.io.log.warn(
+        'close requested while the gate is stopped after a closing run; the next pulse would open, so no corrective pulse is sent',
+      );
+      this.requestedTarget = null;
+      this.emitSnapshot('close-request-not-directly-actionable-from-stopped-closing');
       return;
     }
 
-    await this.startCloseSeek(0, 'homekit-close-from-openish');
+    await this.startAmbiguousCloseAttempt('homekit-close-from-openish-ambiguous');
   }
 
   private async startOpeningFromClosed(reason: string): Promise<void> {
@@ -407,32 +459,53 @@ export class FrontGateFsm {
     this.startOpeningMotion('homekit', `${reason}-pulse-sent`);
   }
 
-  private async startCloseSeek(attempt: number, reason: string): Promise<void> {
+  private async startOpeningFromStoppedState(reason: string): Promise<void> {
+    if (this.facts.closedSensor === true) {
+      await this.startOpeningFromClosed(`${reason}-closed-fallback`);
+      return;
+    }
+
+    await this.pulseMotor(reason);
+    this.startOpeningMotion('homekit', `${reason}-pulse-sent`);
+  }
+
+  private async startKnownCloseFromIdle(reason: string): Promise<void> {
     if (this.facts.closedSensor === true) {
       this.requestedTarget = null;
       this.emitSnapshot(`${reason}-already-closed`);
       return;
     }
 
-    await this.pulseMotor(`${reason}-attempt-${attempt + 1}`);
-    this.startClosingMotion(
-      'goalOnly',
-      attempt === 0 ? 'homekit' : 'recovery',
-      attempt,
-      `${reason}-pulse-sent`,
-    );
+    await this.pulseMotor(reason);
+    this.startClosingMotion('known', 'homekit', `${reason}-pulse-sent`);
+  }
+
+  private async startAmbiguousCloseAttempt(reason: string): Promise<void> {
+    if (this.facts.closedSensor === true) {
+      this.requestedTarget = null;
+      this.emitSnapshot(`${reason}-already-closed`);
+      return;
+    }
+
+    await this.pulseMotor(reason);
+    this.startClosingMotion('goalOnly', 'homekit', `${reason}-pulse-sent`);
   }
 
   private async reverseKnownMotion(finalDirection: MotionDirection, reason: string): Promise<void> {
+    if (this.plan.kind !== 'moving') {
+      return;
+    }
+
+    const stoppedFrom = this.plan.direction;
     await this.pulseMotor(`${reason}-stop-current-motion`);
 
     const deadlineAt = Date.now() + this.pulseGapMs + this.travelMs;
     this.clearMovementTimer();
     this.plan = {
       kind: 'waitingSecondPulse',
+      stoppedFrom,
       finalDirection,
       source: 'homekit',
-      attempt: 0,
       dueAt: Date.now() + this.pulseGapMs,
       deadlineAt,
       reason: finalDirection === 'opening' ? 'reverseToOpen' : 'reverseToClose',
@@ -448,7 +521,6 @@ export class FrontGateFsm {
       direction: 'opening',
       certainty: 'known',
       source,
-      attempt: 0,
       startedAt: Date.now(),
       deadlineAt: Date.now() + this.travelMs,
     };
@@ -459,7 +531,6 @@ export class FrontGateFsm {
   private startClosingMotion(
     certainty: MotionCertainty,
     source: MotionSource,
-    attempt: number,
     note: string,
   ): void {
     this.clearPhaseTimer();
@@ -468,7 +539,6 @@ export class FrontGateFsm {
       direction: 'closing',
       certainty,
       source,
-      attempt,
       startedAt: Date.now(),
       deadlineAt: Date.now() + this.travelMs,
     };
@@ -531,24 +601,16 @@ export class FrontGateFsm {
     }
 
     const finalDirection = this.plan.finalDirection;
-    const source = this.plan.source;
-    const attempt = this.plan.attempt;
-    const deadlineAt = this.plan.deadlineAt;
 
     await this.pulseMotor(`second-pulse-${finalDirection}`);
 
     this.clearPhaseTimer();
-    this.plan = {
-      kind: 'moving',
-      direction: finalDirection,
-      certainty: 'known',
-      source,
-      attempt,
-      startedAt: Date.now(),
-      deadlineAt,
-    };
-    this.scheduleMovementTimer(deadlineAt);
-    this.emitSnapshot(`second-pulse-fired-${finalDirection}`);
+    if (finalDirection === 'opening') {
+      this.startOpeningMotion(this.plan.source, `second-pulse-fired-${finalDirection}`);
+      return;
+    }
+
+    this.startClosingMotion('known', this.plan.source, `second-pulse-fired-${finalDirection}`);
   }
 
   private async handleMovementTimeout(): Promise<void> {
@@ -559,38 +621,90 @@ export class FrontGateFsm {
     if (this.facts.closedSensor === true) {
       this.clearTimers();
       this.plan = { kind: 'idle' };
+      this.idleNextPulseDirection = 'opening';
       this.requestedTarget = null;
       this.emitSnapshot('movement-timeout-but-already-closed');
       return;
     }
 
     if (this.plan.direction === 'opening') {
-      // Fully-open and partially-open look the same to us. When the opening
-      // window expires we intentionally collapse to the generic open-ish state
-      // and report it as OPEN unless the closed end-stop says otherwise.
+      // Fully-open and partially-open look identical to us. Once the opening window
+      // expires without any contrary evidence, collapse to the stable open state.
       this.clearTimers();
       this.plan = { kind: 'idle' };
+      this.idleNotClosedMode = 'openKnown';
+      this.idleNextPulseDirection = 'closing';
+
+      if (this.requestedTarget === 'closed' && this.isAvailableForHomeKit()) {
+        this.emitSnapshot('opening-window-elapsed-but-close-still-requested');
+        void this.enqueue('auto-close-after-open', async () => {
+          await this.startKnownCloseFromIdle('auto-close-after-open');
+        });
+        return;
+      }
+
       this.requestedTarget = null;
-      this.emitSnapshot('opening-window-elapsed-openish');
+      this.emitSnapshot('opening-window-elapsed-open');
       return;
     }
 
-    if (this.requestedTarget === 'closed' && this.plan.attempt < this.closeRetryLimit) {
-      const nextAttempt = this.plan.attempt + 1;
-      this.io.log.warn(
-        'close window elapsed without a closed-sensor hit; retrying close seek from the generic open-ish state',
-      );
-      this.clearTimers();
-      this.plan = { kind: 'idle' };
-      await this.startCloseSeek(nextAttempt, 'close-timeout-retry');
-      return;
-    }
-
-    this.io.log.warn('close window elapsed without reaching the closed sensor; leaving gate in open-ish state');
+    this.io.log.warn(
+      this.plan.certainty === 'known'
+        ? 'closing window elapsed without reaching the closed sensor; leaving gate in generic open-ish state'
+        : 'ambiguous close attempt elapsed without reaching the closed sensor; leaving gate in generic open-ish state',
+    );
     this.clearTimers();
     this.plan = { kind: 'idle' };
+    this.idleNotClosedMode = 'openishUnknown';
+    this.idleNextPulseDirection = 'unknown';
     this.requestedTarget = null;
     this.emitSnapshot('closing-window-elapsed-openish');
+  }
+
+  private applyObservedExternalPulse(reason: string): void {
+    this.lastPulseLikeActivityAt = Date.now();
+    this.requestedTarget = null;
+
+    if (this.facts.closedSensor === true) {
+      this.startOpeningMotion('external', `external-pulse-observed-while-closed-${reason}`);
+      return;
+    }
+
+    if (this.plan.kind === 'moving') {
+      const currentDirection = this.plan.direction;
+      const currentCertainty = this.plan.certainty;
+      this.clearTimers();
+      this.plan = { kind: 'idle' };
+      this.idleNotClosedMode = 'openishUnknown';
+      this.idleNextPulseDirection = currentCertainty === 'known'
+        ? oppositeDirection(currentDirection)
+        : 'unknown';
+      this.emitSnapshot(`external-pulse-stopped-${currentDirection}-${reason}`);
+      return;
+    }
+
+    if (this.plan.kind === 'waitingSecondPulse') {
+      const finalDirection = this.plan.finalDirection;
+      this.clearTimers();
+      if (finalDirection === 'opening') {
+        this.startOpeningMotion('external', `external-pulse-fired-pending-opening-${reason}`);
+        return;
+      }
+      this.startClosingMotion('known', 'external', `external-pulse-fired-pending-closing-${reason}`);
+      return;
+    }
+
+    if (this.idleNextPulseDirection === 'opening') {
+      this.startOpeningMotion('external', `external-pulse-started-opening-${reason}`);
+      return;
+    }
+
+    if (this.idleNextPulseDirection === 'closing') {
+      this.startClosingMotion('known', 'external', `external-pulse-started-closing-${reason}`);
+      return;
+    }
+
+    this.emitSnapshot(`external-pulse-observed-direction-unknown-${reason}`);
   }
 
   private enterUnavailable(note: string): void {
@@ -598,6 +712,8 @@ export class FrontGateFsm {
     this.plan = { kind: 'idle' };
     this.requestedTarget = null;
     this.sensorFreshSinceOnline = false;
+    this.idleNotClosedMode = 'openishUnknown';
+    this.idleNextPulseDirection = 'unknown';
     this.emitSnapshot(note);
   }
 
@@ -641,6 +757,8 @@ export class FrontGateFsm {
       motionDirection: this.getMotionDirection(),
       motionCertainty: this.getMotionCertainty(),
       planKind: this.plan.kind,
+      idleNotClosedMode: this.idleNotClosedMode,
+      nextPulseDirection: this.idleNextPulseDirection,
       note,
     };
   }

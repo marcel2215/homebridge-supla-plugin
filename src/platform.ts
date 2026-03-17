@@ -756,7 +756,7 @@ export class SuplaPlatform implements DynamicPlatformPlugin {
       return fallbackMs;
     }
     const rounded = Math.round(parsed);
-    return Math.min(10000, Math.max(0, rounded));
+    return Math.min(15000, Math.max(3000, rounded));
   }
 
   private normalizeGatePublishRetryDelayMs(value?: number): number {
@@ -780,13 +780,13 @@ export class SuplaPlatform implements DynamicPlatformPlugin {
   }
 
   private normalizeFrontGateReversePauseMs(value?: number): number {
-    const fallbackMs = 900;
+    const fallbackMs = 3000;
     const parsed = Number(value);
     if (!Number.isFinite(parsed)) {
       return fallbackMs;
     }
     const rounded = Math.round(parsed);
-    return Math.min(10000, Math.max(100, rounded));
+    return Math.min(15000, Math.max(3000, rounded));
   }
 
   private normalizeFrontGateWrongDirectionRunMs(value?: number): number {
@@ -800,7 +800,7 @@ export class SuplaPlatform implements DynamicPlatformPlugin {
   }
 
   private normalizeFrontGateMinimumPulseGapMs(value?: number): number {
-    const fallbackMs = 400;
+    const fallbackMs = 3000;
     const parsed = Number(value);
     if (!Number.isFinite(parsed)) {
       return fallbackMs;
@@ -810,7 +810,7 @@ export class SuplaPlatform implements DynamicPlatformPlugin {
   }
 
   private normalizeFrontGateCloseRetryLimit(value?: number): number {
-    const fallbackValue = 1;
+    const fallbackValue = 0;
     const parsed = Number(value);
     if (!Number.isFinite(parsed)) {
       return fallbackValue;
