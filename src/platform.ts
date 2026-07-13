@@ -1,4 +1,5 @@
 import { API, DynamicPlatformPlugin, Logger, PlatformAccessory, PlatformConfig, Service, Characteristic } from 'homebridge';
+import type {IPublishPacket} from 'mqtt';
 
 import { PLATFORM_NAME, PLUGIN_NAME } from './settings';
 import { GarageDoorOpenerAccesory } from './Accesories/GarageDoorOpenerAccesory';
@@ -25,7 +26,17 @@ import {ThermostatAccessory} from './Accesories/ThermostatAccessory';
 import {ElectricityMeterAccessory} from './Accesories/ElectricityMeterAccessory';
 import {DimmerRgbLightAccessory} from './Accesories/DimmerRgbLightAccessory';
 import {ActionTriggerAccessory} from './Accesories/ActionTriggerAccessory';
-import type {FrontGateTimingConfig} from './Accesories/FrontGateFsm';
+import type {
+  FrontGateConfig,
+  UnknownClosePolicy,
+  UnknownOpenPolicy,
+} from './Accesories/FrontGateFsm';
+
+export type MqttMessageHandler = (message: Buffer, topic: string, packet: IPublishPacket) => void;
+
+export interface MqttHandlerOptions {
+  noLocal?: boolean;
+}
 
 
 /**
@@ -46,9 +57,6 @@ export class SuplaPlatform implements DynamicPlatformPlugin {
   private readonly coveringExecuteActionClose: string;
   private readonly coveringExecuteActionStop: string;
   private readonly coveringTravelTimeSeconds: number;
-  private readonly gateControlMode: 'execute_action' | 'toggle';
-  private readonly gateExecuteActionOpen: string;
-  private readonly gateExecuteActionClose: string;
   private readonly gateExecuteActionToggle: string;
   private readonly gateLockControlMode: 'execute_action' | 'set_on_pulse';
   private readonly gateLockExecuteAction: string;
@@ -56,23 +64,23 @@ export class SuplaPlatform implements DynamicPlatformPlugin {
   private readonly gateLockPulseSeconds: number;
   private readonly gateLockSetOnPayload: string;
   private readonly gateLockSetOffPayload: string;
-  private readonly gatePartialHiMode: 'moving' | 'open_endstop' | 'pedestrian_endstop' | 'ignore';
-  private readonly gateReverseFollowUpDelayMs: number;
-  private readonly gateOpenAssumeDelayMs: number;
-  private readonly gateCommandCooldownMs: number;
-  private readonly gatePublishRetryDelayMs: number;
-  private readonly gateStrictReverseDoublePulse: boolean;
-  private readonly gateDebugTimeline: boolean;
   private readonly frontGateFullTravelMs: number;
   private readonly frontGateReversePauseMs: number;
-  private readonly frontGateWrongDirectionRunMs: number;
   private readonly frontGateMinimumPulseGapMs: number;
-  private readonly frontGateCloseRetryLimit: number;
+  private readonly frontGateUnknownOpenPolicy: UnknownOpenPolicy;
+  private readonly frontGateUnknownClosePolicy: UnknownClosePolicy;
+  private readonly frontGateSeekClosedMaxPulses: number;
+  private readonly frontGateAssumeOpenAfterTravel: boolean;
+  private readonly frontGateSensorFallbackToControlChannel: boolean;
+  private readonly mqttProtocolVersion: 4 | 5;
   private readonly commandQos: 0 | 1 | 2;
   private readonly commandRetain: boolean;
-  private readonly mqttHandlers = new Map<string, Set<(message: Buffer, topic: string) => void>>();
-  private readonly mqttHandlerOwners = new Map<string, Map<string, Set<(message: Buffer, topic: string) => void>>>();
-  private readonly mqttWildcardHandlers = new Map<string, Set<(message: Buffer, topic: string) => void>>();
+  private readonly mqttHandlers = new Map<string, Set<MqttMessageHandler>>();
+  private readonly mqttHandlerOwners = new Map<string, Map<string, Set<MqttMessageHandler>>>();
+  private readonly mqttWildcardHandlers = new Map<string, Set<MqttMessageHandler>>();
+  private readonly mqttNoLocalTopics = new Set<string>();
+  private readonly mqttTransportHandlers = new Map<string, Set<(connected: boolean) => void>>();
+  private readonly channelRegistry = new Map<string, SuplaChannelContext>();
   private readonly ownerCleanups = new Map<string, Set<() => void>>();
   private readonly mqttDesiredSubscriptions = new Set<string>();
   private readonly mqttSubscriptions = new Set<string>();
@@ -87,6 +95,7 @@ export class SuplaPlatform implements DynamicPlatformPlugin {
   }>();
 
   private mqttRouterAttached = false;
+  private mqttTransportConnected = false;
 
   constructor(
     public readonly log: Logger,
@@ -102,9 +111,6 @@ export class SuplaPlatform implements DynamicPlatformPlugin {
       coveringExecuteActionClose?: string;
       coveringExecuteActionStop?: string;
       coveringTravelTimeSeconds?: number;
-      gateControlMode?: string;
-      gateExecuteActionOpen?: string;
-      gateExecuteActionClose?: string;
       gateExecuteActionToggle?: string;
       gateLockControlMode?: string;
       gateLockExecuteAction?: string;
@@ -112,18 +118,15 @@ export class SuplaPlatform implements DynamicPlatformPlugin {
       gateLockPulseSeconds?: number;
       gateLockSetOnPayload?: string;
       gateLockSetOffPayload?: string;
-      gatePartialHiMode?: string;
-      gateReverseFollowUpDelayMs?: number;
-      gateOpenAssumeDelayMs?: number;
-      gateCommandCooldownMs?: number;
-      gatePublishRetryDelayMs?: number;
-      gateStrictReverseDoublePulse?: boolean | string;
-      gateDebugTimeline?: boolean | string;
       frontGateFullTravelMs?: number;
       frontGateReversePauseMs?: number;
-      frontGateWrongDirectionRunMs?: number;
       frontGateMinimumPulseGapMs?: number;
-      frontGateCloseRetryLimit?: number;
+      frontGateUnknownOpenPolicy?: string;
+      frontGateUnknownClosePolicy?: string;
+      frontGateSeekClosedMaxPulses?: number;
+      frontGateAssumeOpenAfterTravel?: boolean | string;
+      frontGateSensorFallbackToControlChannel?: boolean | string;
+      mqttProtocolVersion?: number;
       commandQos?: number;
       commandRetain?: boolean | string;
     };
@@ -134,9 +137,6 @@ export class SuplaPlatform implements DynamicPlatformPlugin {
     this.coveringExecuteActionClose = (configView.coveringExecuteActionClose || 'shut').toString();
     this.coveringExecuteActionStop = (configView.coveringExecuteActionStop || 'stop').toString();
     this.coveringTravelTimeSeconds = Number(configView.coveringTravelTimeSeconds) || 0;
-    this.gateControlMode = this.normalizeGateControlMode(configView.gateControlMode);
-    this.gateExecuteActionOpen = (configView.gateExecuteActionOpen || 'open_close').toString();
-    this.gateExecuteActionClose = (configView.gateExecuteActionClose || 'open_close').toString();
     this.gateExecuteActionToggle = (configView.gateExecuteActionToggle || 'open_close').toString();
     this.gateLockControlMode = this.normalizeGateLockControlMode(configView.gateLockControlMode);
     this.gateLockExecuteAction = (configView.gateLockExecuteAction || 'open').toString();
@@ -144,38 +144,29 @@ export class SuplaPlatform implements DynamicPlatformPlugin {
     this.gateLockPulseSeconds = Number(configView.gateLockPulseSeconds) || 0;
     this.gateLockSetOnPayload = (configView.gateLockSetOnPayload ?? 'true').toString();
     this.gateLockSetOffPayload = (configView.gateLockSetOffPayload ?? 'false').toString();
-    this.gatePartialHiMode = this.normalizeGatePartialHiMode(configView.gatePartialHiMode);
-    this.gateReverseFollowUpDelayMs = this.normalizeGateReverseFollowUpDelayMs(
-      configView.gateReverseFollowUpDelayMs,
-    );
-    this.gateOpenAssumeDelayMs = this.normalizeGateOpenAssumeDelayMs(
-      configView.gateOpenAssumeDelayMs,
-    );
-    this.gateCommandCooldownMs = this.normalizeGateCommandCooldownMs(
-      configView.gateCommandCooldownMs,
-    );
-    this.gatePublishRetryDelayMs = this.normalizeGatePublishRetryDelayMs(
-      configView.gatePublishRetryDelayMs,
-    );
-    this.gateStrictReverseDoublePulse = this.parseBoolean(
-      configView.gateStrictReverseDoublePulse ?? true,
-    );
-    this.gateDebugTimeline = this.parseBoolean(configView.gateDebugTimeline ?? false);
-    this.frontGateFullTravelMs = this.normalizeFrontGateFullTravelMs(
-      configView.frontGateFullTravelMs ?? configView.gateOpenAssumeDelayMs,
-    );
+    this.frontGateFullTravelMs = this.normalizeFrontGateFullTravelMs(configView.frontGateFullTravelMs);
     this.frontGateReversePauseMs = this.normalizeFrontGateReversePauseMs(
       configView.frontGateReversePauseMs,
     );
-    this.frontGateWrongDirectionRunMs = this.normalizeFrontGateWrongDirectionRunMs(
-      configView.frontGateWrongDirectionRunMs,
-    );
     this.frontGateMinimumPulseGapMs = this.normalizeFrontGateMinimumPulseGapMs(
-      configView.frontGateMinimumPulseGapMs ?? configView.gateCommandCooldownMs,
+      configView.frontGateMinimumPulseGapMs,
     );
-    this.frontGateCloseRetryLimit = this.normalizeFrontGateCloseRetryLimit(
-      configView.frontGateCloseRetryLimit,
+    this.frontGateUnknownOpenPolicy = this.normalizeFrontGateUnknownOpenPolicy(
+      configView.frontGateUnknownOpenPolicy,
     );
+    this.frontGateUnknownClosePolicy = this.normalizeFrontGateUnknownClosePolicy(
+      configView.frontGateUnknownClosePolicy,
+    );
+    this.frontGateSeekClosedMaxPulses = this.normalizeFrontGateSeekClosedMaxPulses(
+      configView.frontGateSeekClosedMaxPulses,
+    );
+    this.frontGateAssumeOpenAfterTravel = this.parseBoolean(
+      configView.frontGateAssumeOpenAfterTravel ?? false,
+    );
+    this.frontGateSensorFallbackToControlChannel = this.parseBoolean(
+      configView.frontGateSensorFallbackToControlChannel ?? false,
+    );
+    this.mqttProtocolVersion = this.normalizeMqttProtocolVersion(configView.mqttProtocolVersion);
     this.commandQos = this.normalizeCommandQos(configView.commandQos);
     this.commandRetain = this.parseBoolean(configView.commandRetain ?? false);
 
@@ -192,18 +183,23 @@ export class SuplaPlatform implements DynamicPlatformPlugin {
       this.MqttClient = new SuplaMqttClient(mqttSettings, this.log);
       this.startMqttRouter();
       this.MqttClient.client.on('connect', () => {
+        this.updateMqttTransportState(true);
         this.resubscribeAll(true);
       });
       this.MqttClient.client.on('close', () => {
+        this.updateMqttTransportState(false);
         this.clearActiveSubscriptions();
       });
       this.MqttClient.client.on('offline', () => {
+        this.updateMqttTransportState(false);
         this.clearActiveSubscriptions();
       });
       this.MqttClient.client.on('end', () => {
+        this.updateMqttTransportState(false);
         this.clearActiveSubscriptions();
       });
       if (this.MqttClient.client.connected) {
+        this.updateMqttTransportState(true);
         this.resubscribeAll(true);
       }
       this.discoverDevices();
@@ -239,9 +235,11 @@ export class SuplaPlatform implements DynamicPlatformPlugin {
     }
     const normalized = this.normalizeChannelContext(cachedDevice);
     accessory.context.device = normalized;
-    accessory.context.deviceSignature = this.getChannelSignature(normalized);
-    const configured = this.setupAccessory(normalized, accessory);
-    accessory.context.deviceConfigured = configured;
+    this.addChannelToRegistry(normalized);
+    // Accessory construction is intentionally deferred until didFinishLaunching.
+    // Homebridge restores cached accessories one at a time, so configuring a gate
+    // here could pair it before its separate contact-sensor accessory is known.
+    accessory.context.deviceConfigured = false;
   }
 
   /**
@@ -251,7 +249,15 @@ export class SuplaPlatform implements DynamicPlatformPlugin {
    */
   discoverDevices(channelsOverride?: Array<SuplaChannelContext>) {
     const rawChannels = channelsOverride ?? this.loadChannelsFromConfig();
-    const channels = rawChannels.map(channel => this.normalizeChannelContext(channel));
+    let channels = rawChannels.map(channel => this.normalizeChannelContext(channel));
+    if (channels.length === 0 && channelsOverride === undefined) {
+      channels = this.accessories
+        .map(accessory => accessory.context.device as SuplaChannelContext | undefined)
+        .filter((channel): channel is SuplaChannelContext => Boolean(channel))
+        .map(channel => this.normalizeChannelContext(channel));
+    }
+    channels = this.deduplicateChannels(channels);
+    this.replaceChannelRegistry(channels);
     this.log.info('Channels discovered:', channels.length);
     this.log.debug(
       `Discovery mode: ${channelsOverride ? 'live' : 'cached'} channels`,
@@ -365,6 +371,7 @@ export class SuplaPlatform implements DynamicPlatformPlugin {
         return;
       }
       platformConfig.channels = JSON.stringify(channels);
+      (this.config as unknown as {channels?: unknown}).channels = platformConfig.channels;
       const payload = JSON.stringify(config, null, 2);
       const tempPath = `${configPath}.tmp`;
       fs.writeFileSync(tempPath, payload);
@@ -423,13 +430,77 @@ export class SuplaPlatform implements DynamicPlatformPlugin {
   }
 
   private getChannelSignature(channel: SuplaChannelContext): string {
-    return [
+    const signature = [
       channel.topic ?? '',
       channel.channelFunction ?? '',
       channel.channelType ?? '',
       channel.deviceId ?? '',
       channel.channelId ?? '',
+    ];
+
+    if (channel.channelFunction === 'CONTROLLINGTHEGATE') {
+      const configView = this.config as unknown as {
+        frontGateSensorTopic?: string;
+        frontGateSensorDeviceId?: string | number;
+        frontGateSensorChannelId?: string | number;
+      };
+      const sensorRegistrySignature = Array.from(this.channelRegistry.values())
+        .filter(candidate => {
+          const functionName = (candidate.channelFunction ?? '').toUpperCase();
+          const typeName = (candidate.channelType ?? '').toUpperCase();
+          return functionName.startsWith('OPENINGSENSOR_') || typeName === 'BINARYSENSOR';
+        })
+        .map(candidate => [
+          candidate.topic,
+          candidate.channelFunction,
+          candidate.channelType,
+          candidate.deviceId,
+          candidate.channelId,
+          candidate.channelCaption,
+        ].join(':'))
+        .sort()
+        .join(';');
+      signature.push(
+        configView.frontGateSensorTopic ?? '',
+        String(configView.frontGateSensorDeviceId ?? ''),
+        String(configView.frontGateSensorChannelId ?? ''),
+        String(this.frontGateSensorFallbackToControlChannel),
+        sensorRegistrySignature,
+      );
+    }
+
+    return signature.join('|');
+  }
+
+  private getChannelRegistryKey(channel: SuplaChannelContext): string {
+    return [
+      channel.deviceId ?? '',
+      channel.channelId ?? '',
+      this.normalizeTopicBase(channel.topic),
     ].join('|');
+  }
+
+  private addChannelToRegistry(channel: SuplaChannelContext): void {
+    this.channelRegistry.set(this.getChannelRegistryKey(channel), channel);
+  }
+
+  private replaceChannelRegistry(channels: SuplaChannelContext[]): void {
+    this.channelRegistry.clear();
+    for (const channel of channels) {
+      this.addChannelToRegistry(channel);
+    }
+  }
+
+  private deduplicateChannels(channels: SuplaChannelContext[]): SuplaChannelContext[] {
+    const byKey = new Map<string, SuplaChannelContext>();
+    for (const channel of channels) {
+      byKey.set(this.getChannelRegistryKey(channel), channel);
+    }
+    return Array.from(byKey.values());
+  }
+
+  public getKnownChannels(): SuplaChannelContext[] {
+    return Array.from(this.channelRegistry.values());
   }
 
   private resetAccessoryServices(accessory: PlatformAccessory) {
@@ -591,18 +662,6 @@ export class SuplaPlatform implements DynamicPlatformPlugin {
     return this.coveringTravelTimeSeconds;
   }
 
-  public getGateControlMode(): 'execute_action' | 'toggle' {
-    return this.gateControlMode;
-  }
-
-  public getGateExecuteActionOpen(): string {
-    return this.gateExecuteActionOpen;
-  }
-
-  public getGateExecuteActionClose(): string {
-    return this.gateExecuteActionClose;
-  }
-
   public getGateExecuteActionToggle(): string {
     return this.gateExecuteActionToggle;
   }
@@ -631,59 +690,28 @@ export class SuplaPlatform implements DynamicPlatformPlugin {
     return this.gateLockSetOffPayload;
   }
 
-  public getGatePartialHiMode(): 'moving' | 'open_endstop' | 'pedestrian_endstop' | 'ignore' {
-    return this.gatePartialHiMode;
-  }
-
-  public getGateReverseFollowUpDelayMs(): number {
-    return this.gateReverseFollowUpDelayMs;
-  }
-
-  public getGateOpenAssumeDelayMs(): number {
-    return this.gateOpenAssumeDelayMs;
-  }
-
-  public getGateCommandCooldownMs(): number {
-    return this.gateCommandCooldownMs;
-  }
-
-  public getGatePublishRetryDelayMs(): number {
-    return this.gatePublishRetryDelayMs;
-  }
-
-  public getGateStrictReverseDoublePulse(): boolean {
-    return this.gateStrictReverseDoublePulse;
-  }
-
-  public getGateDebugTimeline(): boolean {
-    return this.gateDebugTimeline;
-  }
-
-  public getFrontGateTimings(): FrontGateTimingConfig {
+  public getFrontGateConfig(): FrontGateConfig {
     return {
       fullTravelMs: this.frontGateFullTravelMs,
       reversePauseMs: this.frontGateReversePauseMs,
-      wrongDirectionRunMs: this.frontGateWrongDirectionRunMs,
       minimumPulseGapMs: this.frontGateMinimumPulseGapMs,
-      closeRetryLimit: this.frontGateCloseRetryLimit,
+      unknownOpenPolicy: this.frontGateUnknownOpenPolicy,
+      unknownClosePolicy: this.frontGateUnknownClosePolicy,
+      seekClosedMaxPulses: this.frontGateSeekClosedMaxPulses,
+      assumeOpenAfterTravel: this.frontGateAssumeOpenAfterTravel,
     };
   }
 
-  public getFrontGatePulseAction(): string {
-    const toggleAction = this.gateExecuteActionToggle.trim();
-    if (toggleAction) {
-      return toggleAction;
-    }
+  public shouldFallbackFrontGateSensorToControlChannel(): boolean {
+    return this.frontGateSensorFallbackToControlChannel;
+  }
 
-    const openAction = this.gateExecuteActionOpen.trim();
-    const closeAction = this.gateExecuteActionClose.trim();
-    if (openAction && openAction === closeAction) {
-      return openAction;
-    }
-    if (openAction) {
-      return openAction;
-    }
-    return closeAction;
+  public isMqttNoLocalAvailable(): boolean {
+    return this.mqttProtocolVersion === 5;
+  }
+
+  public getFrontGatePulseAction(): string {
+    return this.gateExecuteActionToggle.trim();
   }
 
   private normalizeCoveringControlMode(value?: string): 'set' | 'execute_action' | 'hybrid' {
@@ -697,76 +725,12 @@ export class SuplaPlatform implements DynamicPlatformPlugin {
     return 'set';
   }
 
-  private normalizeGateControlMode(value?: string): 'execute_action' | 'toggle' {
-    const normalized = (value ?? 'execute_action').toString().toLowerCase();
-    if (normalized === 'toggle') {
-      return 'toggle';
-    }
-    return 'execute_action';
-  }
-
   private normalizeGateLockControlMode(value?: string): 'execute_action' | 'set_on_pulse' {
     const normalized = (value ?? 'execute_action').toString().toLowerCase();
     if (normalized === 'set_on_pulse') {
       return 'set_on_pulse';
     }
     return 'execute_action';
-  }
-
-  private normalizeGatePartialHiMode(
-    value?: string,
-  ): 'moving' | 'open_endstop' | 'pedestrian_endstop' | 'ignore' {
-    const normalized = (value ?? 'moving').toString().toLowerCase();
-    if (normalized === 'open_endstop' || normalized === 'open') {
-      return 'open_endstop';
-    }
-    if (normalized === 'pedestrian_endstop' || normalized === 'pedestrian') {
-      return 'pedestrian_endstop';
-    }
-    if (normalized === 'ignore' || normalized === 'absent') {
-      return 'ignore';
-    }
-    return 'moving';
-  }
-
-  private normalizeGateReverseFollowUpDelayMs(value?: number): number {
-    const fallbackMs = 3000;
-    const parsed = Number(value);
-    if (!Number.isFinite(parsed)) {
-      return fallbackMs;
-    }
-    const rounded = Math.round(parsed);
-    return Math.min(10000, Math.max(250, rounded));
-  }
-
-  private normalizeGateOpenAssumeDelayMs(value?: number): number {
-    const fallbackMs = 22000;
-    const parsed = Number(value);
-    if (!Number.isFinite(parsed)) {
-      return fallbackMs;
-    }
-    const rounded = Math.round(parsed);
-    return Math.min(120000, Math.max(1000, rounded));
-  }
-
-  private normalizeGateCommandCooldownMs(value?: number): number {
-    const fallbackMs = 700;
-    const parsed = Number(value);
-    if (!Number.isFinite(parsed)) {
-      return fallbackMs;
-    }
-    const rounded = Math.round(parsed);
-    return Math.min(15000, Math.max(3000, rounded));
-  }
-
-  private normalizeGatePublishRetryDelayMs(value?: number): number {
-    const fallbackMs = 300;
-    const parsed = Number(value);
-    if (!Number.isFinite(parsed)) {
-      return fallbackMs;
-    }
-    const rounded = Math.round(parsed);
-    return Math.min(5000, Math.max(0, rounded));
   }
 
   private normalizeFrontGateFullTravelMs(value?: number): number {
@@ -789,16 +753,6 @@ export class SuplaPlatform implements DynamicPlatformPlugin {
     return Math.min(15000, Math.max(3000, rounded));
   }
 
-  private normalizeFrontGateWrongDirectionRunMs(value?: number): number {
-    const fallbackMs = 700;
-    const parsed = Number(value);
-    if (!Number.isFinite(parsed)) {
-      return fallbackMs;
-    }
-    const rounded = Math.round(parsed);
-    return Math.min(5000, Math.max(100, rounded));
-  }
-
   private normalizeFrontGateMinimumPulseGapMs(value?: number): number {
     const fallbackMs = 3000;
     const parsed = Number(value);
@@ -806,17 +760,32 @@ export class SuplaPlatform implements DynamicPlatformPlugin {
       return fallbackMs;
     }
     const rounded = Math.round(parsed);
-    return Math.min(10000, Math.max(0, rounded));
+    return Math.min(15000, Math.max(0, rounded));
   }
 
-  private normalizeFrontGateCloseRetryLimit(value?: number): number {
-    const fallbackValue = 0;
+  private normalizeFrontGateUnknownOpenPolicy(value?: string): UnknownOpenPolicy {
+    return value === 'accept_non_closed' ? 'accept_non_closed' : 'reject';
+  }
+
+  private normalizeFrontGateUnknownClosePolicy(value?: string): UnknownClosePolicy {
+    if (value === 'single_pulse_best_effort' || value === 'seek_closed') {
+      return value;
+    }
+    return 'reject';
+  }
+
+  private normalizeFrontGateSeekClosedMaxPulses(value?: number): number {
+    const fallbackValue = 3;
     const parsed = Number(value);
     if (!Number.isFinite(parsed)) {
       return fallbackValue;
     }
     const rounded = Math.round(parsed);
-    return Math.min(3, Math.max(0, rounded));
+    return Math.min(3, Math.max(1, rounded));
+  }
+
+  private normalizeMqttProtocolVersion(value?: number): 4 | 5 {
+    return Number(value) === 5 ? 5 : 4;
   }
 
   private normalizeTopicSuffix(value: string): string {
@@ -837,8 +806,9 @@ export class SuplaPlatform implements DynamicPlatformPlugin {
 
   public registerMqttHandler(
     topic: string,
-    handler: (message: Buffer, topic: string) => void,
+    handler: MqttMessageHandler,
     ownerId: string,
+    options: MqttHandlerOptions = {},
   ): () => void {
     if (!topic) {
       return () => undefined;
@@ -854,6 +824,9 @@ export class SuplaPlatform implements DynamicPlatformPlugin {
     ownerTopics.set(topic, ownerHandlers);
     this.mqttHandlerOwners.set(ownerId, ownerTopics);
     this.mqttDesiredSubscriptions.add(topic);
+    if (options.noLocal && this.mqttProtocolVersion === 5) {
+      this.mqttNoLocalTopics.add(topic);
+    }
     this.ensureSubscribed(topic, false);
     return () => {
       this.removeHandler(topic, handler);
@@ -869,6 +842,26 @@ export class SuplaPlatform implements DynamicPlatformPlugin {
         this.mqttHandlerOwners.delete(ownerId);
       }
     };
+  }
+
+  public registerMqttTransportHandler(
+    handler: (connected: boolean) => void,
+    ownerId: string,
+  ): () => void {
+    const handlers = this.mqttTransportHandlers.get(ownerId) ?? new Set();
+    handlers.add(handler);
+    this.mqttTransportHandlers.set(ownerId, handlers);
+    handler(this.mqttTransportConnected);
+
+    const cleanup = () => {
+      const active = this.mqttTransportHandlers.get(ownerId);
+      active?.delete(handler);
+      if (active?.size === 0) {
+        this.mqttTransportHandlers.delete(ownerId);
+      }
+    };
+    this.registerOwnerCleanup(ownerId, cleanup);
+    return cleanup;
   }
 
   public registerOwnerCleanup(ownerId: string, cleanup: () => void): () => void {
@@ -914,6 +907,8 @@ export class SuplaPlatform implements DynamicPlatformPlugin {
     }
     this.mqttHandlers.clear();
     this.mqttWildcardHandlers.clear();
+    this.mqttNoLocalTopics.clear();
+    this.mqttTransportHandlers.clear();
     this.mqttDesiredSubscriptions.clear();
     this.mqttSubscriptions.clear();
     this.mqttPendingSubscriptions.clear();
@@ -922,6 +917,19 @@ export class SuplaPlatform implements DynamicPlatformPlugin {
   }
 
   public publishCommand(topic: string, payload: string | Buffer, callback?: (error?: Error) => void) {
+    this.publishMqtt(topic, payload, { qos: this.commandQos, retain: this.commandRetain }, callback);
+  }
+
+  public publishGateAction(topic: string, payload: string | Buffer, callback?: (error?: Error) => void) {
+    this.publishMqtt(topic, payload, { qos: 0, retain: false }, callback);
+  }
+
+  private publishMqtt(
+    topic: string,
+    payload: string | Buffer,
+    options: {qos: 0 | 1 | 2; retain: boolean},
+    callback?: (error?: Error) => void,
+  ): void {
     const client = this.MqttClient?.client;
     if (!client || !client.connected) {
       const error = new Error('MQTT not connected');
@@ -934,7 +942,7 @@ export class SuplaPlatform implements DynamicPlatformPlugin {
     client.publish(
       topic,
       payload,
-      { qos: this.commandQos, retain: this.commandRetain },
+      options,
       (error) => {
         if (callback) {
           callback(error);
@@ -964,6 +972,33 @@ export class SuplaPlatform implements DynamicPlatformPlugin {
     return false;
   }
 
+  public parseBooleanStrict(value: unknown): boolean | undefined {
+    if (typeof value === 'boolean') {
+      return value;
+    }
+    if (typeof value === 'number') {
+      if (value === 1) {
+        return true;
+      }
+      if (value === 0) {
+        return false;
+      }
+      return undefined;
+    }
+    if (typeof value !== 'string') {
+      return undefined;
+    }
+
+    const normalized = value.trim().toLowerCase();
+    if (['1', 'true', 'on', 'yes'].includes(normalized)) {
+      return true;
+    }
+    if (['0', 'false', 'off', 'no'].includes(normalized)) {
+      return false;
+    }
+    return undefined;
+  }
+
   private runOwnerCleanup(ownerId: string) {
     const cleanups = this.ownerCleanups.get(ownerId);
     if (!cleanups) {
@@ -979,6 +1014,22 @@ export class SuplaPlatform implements DynamicPlatformPlugin {
       }
     }
     this.ownerCleanups.delete(ownerId);
+  }
+
+  private updateMqttTransportState(connected: boolean): void {
+    if (this.mqttTransportConnected === connected) {
+      return;
+    }
+    this.mqttTransportConnected = connected;
+    for (const handlers of this.mqttTransportHandlers.values()) {
+      for (const handler of handlers) {
+        try {
+          handler(connected);
+        } catch (error) {
+          this.log.error(`MQTT transport handler failed: ${(error as Error).message}`);
+        }
+      }
+    }
   }
 
   private clearActiveSubscriptions() {
@@ -1100,7 +1151,11 @@ export class SuplaPlatform implements DynamicPlatformPlugin {
       return;
     }
     this.mqttPendingSubscriptions.add(topic);
-    this.MqttClient.client.subscribe(topic, (err, granted) => {
+    const subscribeOptions = {
+      qos: 0 as const,
+      ...(this.mqttNoLocalTopics.has(topic) && this.mqttProtocolVersion === 5 ? { nl: true } : {}),
+    };
+    this.MqttClient.client.subscribe(topic, subscribeOptions, (err, granted) => {
       this.mqttPendingSubscriptions.delete(topic);
       if (err) {
         this.logSubscriptionIssue(topic, `MQTT subscribe failed for ${topic}: ${err.message}`);
@@ -1151,6 +1206,7 @@ export class SuplaPlatform implements DynamicPlatformPlugin {
 
   private removeSubscription(topic: string) {
     this.mqttDesiredSubscriptions.delete(topic);
+    this.mqttNoLocalTopics.delete(topic);
     this.mqttPendingSubscriptions.delete(topic);
     this.clearSubscriptionRetry(topic);
     if (!this.MqttClient) {
@@ -1166,7 +1222,7 @@ export class SuplaPlatform implements DynamicPlatformPlugin {
     }
   }
 
-  private removeHandler(topic: string, handler: (message: Buffer, topic: string) => void) {
+  private removeHandler(topic: string, handler: MqttMessageHandler) {
     const handlerMap = this.isWildcardTopic(topic) ? this.mqttWildcardHandlers : this.mqttHandlers;
     const active = handlerMap.get(topic);
     if (!active) {
@@ -1221,15 +1277,15 @@ export class SuplaPlatform implements DynamicPlatformPlugin {
     }
     this.mqttRouterAttached = true;
     this.resubscribeAll(false);
-    this.MqttClient.client.on('message', (topic, message) => {
-      const dispatched = new Set<(message: Buffer, topic: string) => void>();
-      const dispatch = (handler: (message: Buffer, topic: string) => void, label: string) => {
+    this.MqttClient.client.on('message', (topic, message, packet) => {
+      const dispatched = new Set<MqttMessageHandler>();
+      const dispatch = (handler: MqttMessageHandler, label: string) => {
         if (dispatched.has(handler)) {
           return;
         }
         dispatched.add(handler);
         try {
-          handler(message, topic);
+          handler(message, topic, packet);
         } catch (error) {
           this.log.error(
             `MQTT handler error for ${label}: ${(error as Error).message}`,
