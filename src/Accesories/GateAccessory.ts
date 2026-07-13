@@ -153,8 +153,6 @@ export class GateAccessory {
   }
 
   private applySnapshot(snapshot: FrontGateSnapshot): void {
-    this.accessory.updateReachability(snapshot.available);
-
     if (this.service.testCharacteristic(this.platform.Characteristic.StatusActive)) {
       this.service.updateCharacteristic(this.platform.Characteristic.StatusActive, snapshot.available);
     }

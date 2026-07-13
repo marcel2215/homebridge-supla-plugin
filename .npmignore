@@ -1,6 +1,7 @@
 # Ignore source code
 src
 mqtt-example-dumps/
+.codex/
 
 # ------------- Defaults ------------- #
 
