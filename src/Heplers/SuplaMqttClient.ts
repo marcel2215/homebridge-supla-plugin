@@ -1,13 +1,10 @@
-import mqtt, {IPublishPacket, MqttClient} from 'mqtt';
+import mqtt, {MqttClient} from 'mqtt';
 import * as fs from 'fs';
 import {Logger} from 'homebridge';
 import {SuplaMqttClientContext} from './SuplaMqttClientContext';
 import {SuplaChannelContext} from './SuplaChannelContext';
 
-type RegisterHandler = (
-  topic: string,
-  handler: (message: Buffer, topic: string, packet: IPublishPacket) => void,
-) => () => void;
+type RegisterHandler = (topic: string, handler: (message: Buffer, topic: string) => void) => () => void;
 
 export class SuplaMqttClient {
   public client: MqttClient;
@@ -17,7 +14,6 @@ export class SuplaMqttClient {
     const options: mqtt.IClientOptions = {
       username: context.username,
       password: context.password,
-      protocolVersion: Number(context.mqttProtocolVersion) === 5 ? 5 : 4,
       resubscribe: false,
     };
     const protocol = this.resolveProtocol();

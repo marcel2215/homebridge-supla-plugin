@@ -11,7 +11,6 @@ export class SuplaMqttClientContext {
     public tlsServername?: string,
     public includeHidden?: boolean | string,
     public mqttTopicScheme?: string,
-    public mqttProtocolVersion?: number,
   ) {
   }
 }

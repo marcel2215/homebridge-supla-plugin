@@ -58,82 +58,95 @@
         "auto"
       ]
     },
-    "gateExecuteActionToggle": {
-      "title": "Front Gate Toggle Action",
+    "gateControlMode": {
+      "title": "Gate Control Mode",
+      "type": "string",
+      "default": "execute_action",
+      "enum": [
+        "execute_action",
+        "toggle"
+      ]
+    },
+    "gateExecuteActionOpen": {
+      "title": "Gate Execute Action Open",
       "type": "string",
       "default": "open_close"
+    },
+    "gateExecuteActionClose": {
+      "title": "Gate Execute Action Close",
+      "type": "string",
+      "default": "open_close"
+    },
+    "gateExecuteActionToggle": {
+      "title": "Gate Execute Action Toggle",
+      "type": "string",
+      "default": "open_close"
+    },
+    "gatePartialHiMode": {
+      "title": "Gate Partial Hi Mode",
+      "type": "string",
+      "default": "moving",
+      "enum": [
+        "moving",
+        "open_endstop",
+        "pedestrian_endstop",
+        "ignore"
+      ]
+    },
+    "gateReverseFollowUpDelayMs": {
+      "title": "Gate Reverse Follow-up Delay (ms)",
+      "type": "number",
+      "default": 3000
+    },
+    "gateOpenAssumeDelayMs": {
+      "title": "Gate Open Assume Delay (ms)",
+      "type": "number",
+      "default": 22000
+    },
+    "gateCommandCooldownMs": {
+      "title": "Gate Command Cooldown (ms)",
+      "type": "number",
+      "default": 700
+    },
+    "gatePublishRetryDelayMs": {
+      "title": "Gate Publish Retry Delay (ms)",
+      "type": "number",
+      "default": 300
+    },
+    "gateStrictReverseDoublePulse": {
+      "title": "Gate Strict Reverse Double Pulse",
+      "type": "boolean",
+      "default": true
+    },
+    "gateDebugTimeline": {
+      "title": "Gate Debug Timeline",
+      "type": "boolean",
+      "default": false
     },
     "frontGateFullTravelMs": {
       "title": "Front Gate Full Travel (ms)",
       "type": "number",
-      "default": 25000,
-      "minimum": 5000,
-      "maximum": 120000
+      "default": 25000
     },
     "frontGateReversePauseMs": {
       "title": "Front Gate Reverse Pause (ms)",
       "type": "number",
-      "default": 3000,
-      "minimum": 3000,
-      "maximum": 15000
+      "default": 900
+    },
+    "frontGateWrongDirectionRunMs": {
+      "title": "Front Gate Wrong Direction Run (ms)",
+      "type": "number",
+      "default": 700
     },
     "frontGateMinimumPulseGapMs": {
       "title": "Front Gate Minimum Pulse Gap (ms)",
       "type": "number",
-      "default": 3000,
-      "minimum": 0,
-      "maximum": 15000
+      "default": 400
     },
-    "frontGateUnknownOpenPolicy": {
-      "title": "Unknown-State Open Policy",
-      "type": "string",
-      "default": "reject",
-      "enum": [
-        "reject",
-        "accept_non_closed"
-      ]
-    },
-    "frontGateUnknownClosePolicy": {
-      "title": "Unknown-State Close Policy",
-      "type": "string",
-      "default": "reject",
-      "enum": [
-        "reject",
-        "single_pulse_best_effort",
-        "seek_closed"
-      ]
-    },
-    "frontGateSeekClosedMaxPulses": {
-      "title": "Seek-Closed Maximum Pulses",
+    "frontGateCloseRetryLimit": {
+      "title": "Front Gate Close Retry Limit",
       "type": "number",
-      "default": 3,
-      "minimum": 1,
-      "maximum": 3
-    },
-    "frontGateAssumeOpenAfterTravel": {
-      "title": "Assume Fully Open After Travel Time",
-      "type": "boolean",
-      "default": false
-    },
-    "frontGateSensorTopic": {
-      "title": "Front Gate Sensor Base Topic",
-      "type": "string",
-      "default": ""
-    },
-    "frontGateSensorDeviceId": {
-      "title": "Front Gate Sensor Device ID",
-      "type": "string",
-      "default": ""
-    },
-    "frontGateSensorChannelId": {
-      "title": "Front Gate Sensor Channel ID",
-      "type": "string",
-      "default": ""
-    },
-    "frontGateSensorFallbackToControlChannel": {
-      "title": "Use Control Channel as Sensor Fallback",
-      "type": "boolean",
-      "default": false
+      "default": 1
     },
     "gateLockControlMode": {
       "title": "Gate Lock Control Mode",
@@ -208,15 +221,6 @@
       "title": "Covering Travel Time Seconds",
       "type": "number",
       "default": 0
-    },
-    "mqttProtocolVersion": {
-      "title": "MQTT Protocol Version",
-      "type": "number",
-      "default": 4,
-      "enum": [
-        4,
-        5
-      ]
     },
     "commandQos": {
       "title": "Command QoS",
