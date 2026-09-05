@@ -22,7 +22,9 @@
     "version:bump:minor": "npm version minor",
     "version:bump:revision": "npm version patch",
     "publish:plugin": "bash ./scripts/publish.sh",
-    "publish:plugin:dry-run": "bash ./scripts/publish.sh --dry-run"
+    "publish:plugin:dry-run": "bash ./scripts/publish.sh --dry-run",
+    "test": "npm run build && node --test test/*.test.js",
+    "test:report": "npm run build && node scripts/gate-report.js"
   },
   "keywords": [
     "homebridge-plugin",

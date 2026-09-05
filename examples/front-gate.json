@@ -1,0 +1,20 @@
+{
+  "platform": "SuplaPlatform",
+  "frontGateMqttProtocolVersion": 4,
+  "frontGates": [
+    {
+      "deviceId": 123,
+      "channelId": 456,
+      "sensorDeviceId": 123,
+      "sensorChannelId": 457,
+      "sensorInverted": false,
+      "openingTravelMs": 25000,
+      "closingTravelMs": 25000,
+      "travelUncertainty": 0.1,
+      "actuationDelayMs": 2500,
+      "unknownTargetPolicy": "reject",
+      "assumeOpenAfterTravel": false,
+      "allowSpeculativeSequences": false
+    }
+  ]
+}

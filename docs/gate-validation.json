@@ -1,0 +1,115 @@
+{
+  "artifact": "Production FrontGateFsm and adapter validation",
+  "generatedAt": "2026-09-05T17:17:19.267Z",
+  "node": "v24.20.0",
+  "packageVersion": "2.1.33",
+  "homebridgeDependency": "2.1.1",
+  "tests": 66,
+  "passed": 66,
+  "failed": 0,
+  "boundedVisibleHistories": 4096,
+  "stepsPerVisibleHistory": 6,
+  "seededFaultHistories": 2000,
+  "stepsPerFaultHistory": 15,
+  "baseline": {
+    "commit": "18de144d81c04ba3ea40cbc77ce7e78fe73b237d",
+    "pluginPulsesAfterUnexpectedClosure": 2,
+    "physicalState": "opening",
+    "expectedPluginPulses": 1
+  },
+  "userSequence": [
+    {
+      "label": "closed",
+      "at": 0,
+      "actual": "closed",
+      "position": 0,
+      "estimated": "closed",
+      "nextPulse": "opening"
+    },
+    {
+      "label": "open",
+      "at": 0,
+      "actual": "opening",
+      "position": 0,
+      "estimated": "opening",
+      "nextPulse": "stop"
+    },
+    {
+      "label": "stop after opening",
+      "at": 10000,
+      "actual": "stopped",
+      "position": 0.4,
+      "estimated": "stopped",
+      "nextPulse": "closing"
+    },
+    {
+      "label": "close",
+      "at": 13000,
+      "actual": "closing",
+      "position": 0.4,
+      "estimated": "closing",
+      "nextPulse": "stop"
+    },
+    {
+      "label": "stop after closing",
+      "at": 18000,
+      "actual": "stopped",
+      "position": 0.2,
+      "estimated": "stopped",
+      "nextPulse": "opening"
+    },
+    {
+      "label": "open again",
+      "at": 21000,
+      "actual": "opening",
+      "position": 0.2,
+      "estimated": "opening",
+      "nextPulse": "stop"
+    }
+  ],
+  "wrongDirection": {
+    "atFailure": {
+      "available": true,
+      "transportConnected": true,
+      "controlConnected": true,
+      "sensorConnected": true,
+      "closedSensor": true,
+      "sensorFreshSinceOnline": true,
+      "observationEpoch": 0,
+      "currentDoorState": 1,
+      "targetDoorState": 1,
+      "requestedTarget": null,
+      "estimate": {
+        "kind": "closed",
+        "evidence": "contact-confirmed"
+      },
+      "position": {
+        "min": 0,
+        "max": 0
+      },
+      "nextPulseDirection": "opening",
+      "activeRequest": null,
+      "lastResult": {
+        "id": 2,
+        "target": "open",
+        "attempts": 1,
+        "pulseBudget": 1,
+        "outcome": "failed",
+        "reason": "target-mismatch-closed",
+        "endedAt": 50000
+      },
+      "note": "snapshot"
+    },
+    "pulsesAtFailure": 2,
+    "pulsesAfter250Seconds": 2,
+    "physicalFinal": "closed"
+  },
+  "assumptions": [
+    "Virtual nominal plant: 25 seconds per full traversal, closed-only contact, endpoint/stop/reverse button semantics.",
+    "Nominal scenarios use zero transport and sensor lag; additional tests exercise intervals, relay hold, debounce and callback ordering.",
+    "Applied-pulse visibility is an explicit simulated upgrade; raw MQTT and native acceptance are interference only.",
+    "History enumeration is bounded over the defined test alphabet, not exhaustive over real hardware behavior.",
+    "MQTT adapters use mocks plus real MQTT.js offline-queue behavior; HAP characteristic handlers use the installed Homebridge dependency.",
+    "No physical gate, live broker, Apple Home UI or SRPC sidecar deployment was tested."
+  ]
+}

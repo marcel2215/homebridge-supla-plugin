@@ -1,34 +1,30 @@
 import { CharacteristicValue, PlatformAccessory, Service } from 'homebridge';
+import { IPublishPacket } from 'mqtt';
 import { SuplaPlatform } from '../platform';
 import { SuplaChannelContext } from '../Heplers/SuplaChannelContext';
-import {
-  DoorTargetState,
-  FrontGateFsm,
-  FrontGateSnapshot,
-} from './FrontGateFsm';
+import { GateMqttTransport } from '../Heplers/GateMqttTransport';
+import { ContactMetadata, DoorTargetState, FrontGateFsm, FrontGateSnapshot, gateClock } from './FrontGateFsm';
+import { NativeGateObserver } from './GateObservationSource';
 
-type FrontGateConfigView = {
-  channels?: unknown;
-  frontGateSensorTopic?: string;
-  frontGateSensorDeviceId?: string | number;
-  frontGateSensorChannelId?: string | number;
-};
-
-type SensorCandidate = {
-  channel: SuplaChannelContext;
-  baseTopic: string;
-  score: number;
-  reasons: string[];
-};
+export function parseGateBoolean(value: string): boolean | undefined {
+  switch (value.trim().toLowerCase()) {
+    case 'true': case '1': case 'on': case 'yes': return true;
+    case 'false': case '0': case 'off': case 'no': return false;
+    default: return undefined;
+  }
+}
 
 export class GateAccessory {
   private readonly service: Service;
-  private readonly controlBaseTopic: string;
-  private readonly sensorBaseTopic: string;
   private readonly fsm: FrontGateFsm;
-  private pendingSelfCommandEchoCount = 0;
-  private pendingSelfCommandEchoPayload?: string;
-  private pendingSelfCommandEchoExpiresAt = 0;
+  private transport?: GateMqttTransport;
+  private debounceTimer?: ReturnType<typeof setTimeout>;
+  private pendingContact?: boolean;
+  private lastContact?: boolean;
+  private lastLocalAttemptAt = -Infinity;
+  private unsubscribe?: () => void;
+  private reportingImmediate?: ReturnType<typeof setImmediate>;
+  private disposed = false;
 
   constructor(
     private readonly platform: SuplaPlatform,
@@ -38,87 +34,116 @@ export class GateAccessory {
     this.accessory.getService(this.platform.Service.AccessoryInformation)!
       .setCharacteristic(this.platform.Characteristic.Manufacturer, 'Supla')
       .setCharacteristic(this.platform.Characteristic.Model, 'GateController');
-
     const legacyDoor = this.accessory.getService(this.platform.Service.Door);
     if (legacyDoor) {
       this.accessory.removeService(legacyDoor);
     }
-
     this.service = this.accessory.getService(this.platform.Service.GarageDoorOpener)
       || this.accessory.addService(this.platform.Service.GarageDoorOpener);
     this.service.setCharacteristic(this.platform.Characteristic.Name, accessory.displayName);
-
-    this.controlBaseTopic = this.platform.normalizeTopicBase(this.context.topic);
-    this.sensorBaseTopic = this.resolveSensorBaseTopic();
-
-    // Remove stale persisted direction state from the previous implementation.
+    const controlBase = this.platform.normalizeTopicBase(context.topic);
+    const config = this.platform.getFrontGateConfig(context);
     delete this.accessory.context.frontGateFsm;
-
-    this.fsm = new FrontGateFsm(
-      {
-        pulseMotor: async (reason) => this.publishPulse(reason),
-        publishSnapshot: (snapshot) => this.applySnapshot(snapshot),
-        log: {
-          debug: (message) => this.platform.log.debug(`[FrontGate ${this.accessory.displayName}] ${message}`),
-          info: (message) => this.platform.log.info(`[FrontGate ${this.accessory.displayName}] ${message}`),
-          warn: (message) => this.platform.log.warn(`[FrontGate ${this.accessory.displayName}] ${message}`),
-        },
+    this.fsm = new FrontGateFsm({
+      pulseMotor: () => {
+        this.lastLocalAttemptAt = gateClock.now();
+        return this.transport!.publish(this.accessory.UUID);
       },
-      this.platform.getFrontGateTimings(),
-      {},
-    );
-
+      publishSnapshot: snapshot => this.applySnapshot(snapshot),
+      log: {
+        debug: message => this.platform.log.debug(`[FrontGate ${context.deviceId}/${context.channelId}] ${message}`),
+        info: message => this.platform.log.info(`[FrontGate ${context.deviceId}/${context.channelId}] ${message}`),
+        warn: message => this.platform.log.warn(`[FrontGate ${context.deviceId}/${context.channelId}] ${message}`),
+      },
+    }, config.timings);
     this.service.getCharacteristic(this.platform.Characteristic.CurrentDoorState)
       .onGet(this.handleCurrentDoorStateGet.bind(this));
     this.service.getCharacteristic(this.platform.Characteristic.TargetDoorState)
       .onGet(this.handleTargetDoorStateGet.bind(this))
       .onSet(this.handleTargetDoorStateSet.bind(this));
-    this.service.getCharacteristic(this.platform.Characteristic.ObstructionDetected)
-      .onGet(this.handleObstructionDetectedGet.bind(this));
-
-    this.service.updateCharacteristic(this.platform.Characteristic.ObstructionDetected, false);
-
+    this.service.getCharacteristic(this.platform.Characteristic.ObstructionDetected).onGet(() => false);
     this.platform.registerOwnerCleanup(this.accessory.UUID, () => {
+      this.disposed = true;
+      this.clearDebounce();
+      if (this.reportingImmediate) {
+        clearImmediate(this.reportingImmediate);
+      }
       this.fsm.dispose();
+      this.unsubscribe?.();
     });
-
-    this.platform.registerMqttHandler(
-      `${this.controlBaseTopic}/state/connected`,
-      (message) => {
-        this.fsm.handleControlConnectedChange(this.platform.parseBoolean(message.toString()));
-      },
-      this.accessory.UUID,
-    );
-
-    this.platform.registerMqttHandler(
-      `${this.sensorBaseTopic}/state/connected`,
-      (message) => {
-        this.fsm.handleSensorConnectedChange(this.platform.parseBoolean(message.toString()));
-      },
-      this.accessory.UUID,
-    );
-
-    this.platform.registerMqttHandler(
-      `${this.sensorBaseTopic}/state/hi`,
-      (message) => {
-        this.fsm.handleClosedSensorChange(this.platform.parseBoolean(message.toString()));
-      },
-      this.accessory.UUID,
-    );
-
-    this.platform.registerMqttHandler(
-      `${this.controlBaseTopic}/execute_action`,
-      (message) => {
-        const payload = message.toString();
-        if (this.shouldIgnoreObservedExecuteAction(payload)) {
+    if (config.error || !config.sensorBaseTopic) {
+      this.platform.log.warn(`[FrontGate ${accessory.displayName}] ${config.error ?? 'Missing closed sensor mapping.'}`);
+      return;
+    }
+    const sensorBase = config.sensorBaseTopic;
+    this.transport = this.platform.getGateMqttTransport();
+    if (!this.transport.noLocal) {
+      this.platform.log.warn(
+        `[FrontGate ${accessory.displayName}] MQTT 3.1.1 command echoes have ambiguous origin and cancel pending plans.`,
+      );
+    }
+    const observer = config.observationTopic ? new NativeGateObserver(
+      context.deviceId, context.channelId,
+      () => this.fsm.handleCommandIntent('external', 'native-device-accepted'),
+      reason => this.fsm.handleObservationGap(reason),
+    ) : undefined;
+    if (observer) {
+      this.platform.log.info(`[FrontGate ${accessory.displayName}] read-only native observer enabled; coverage=${observer.coverage}`);
+    }
+    let transportEpoch = -1;
+    this.unsubscribe = this.transport.register(
+      accessory.UUID, controlBase, sensorBase, config.observationTopic,
+      (topic, message, packet) => {
+        if (this.disposed) {
           return;
         }
-        this.fsm.handleObservedExternalPulse(`mqtt-execute_action:${payload}`);
+        if (topic === config.observationTopic) {
+          observer?.receive(message, Boolean(packet.retain));
+        } else if (topic === `${controlBase}/execute_action`) {
+          if (packet.retain) {
+            return;
+          }
+          const action = message.toString().trim().toLowerCase();
+          if (['open_close', 'open', 'close', 'stop'].includes(action)) {
+            const couldBeOwn = !this.transport!.noLocal && action === 'open_close'
+              && gateClock.now() - this.lastLocalAttemptAt <= config.timings.publishTimeoutMs + config.timings.actuationDelayMs + 2000;
+            this.fsm.handleCommandIntent(couldBeOwn ? 'ambiguous' : 'external', `mqtt-${action}`);
+          }
+        } else if (topic === `${sensorBase}/state/hi`) {
+          const value = parseGateBoolean(message.toString());
+          if (value === undefined) {
+            this.clearDebounce();
+            this.lastContact = undefined;
+            this.fsm.handleInvalidContact();
+          } else {
+            this.observeContact(config.sensorInverted ? !value : value, packet, config.timings.sensorDebounceMs);
+          }
+        } else {
+          const connected = parseGateBoolean(message.toString()) === true;
+          if (!connected) {
+            this.clearDebounce();
+            this.lastContact = undefined;
+          }
+          if (topic === `${controlBase}/state/connected`) {
+            this.fsm.handleControlConnectedChange(connected);
+          } else {
+            this.fsm.handleSensorConnectedChange(connected);
+          }
+        }
       },
-      this.accessory.UUID,
+      (healthy, epoch) => {
+        const changedEpoch = epoch !== transportEpoch;
+        if (!healthy) {
+          this.clearDebounce();
+          this.lastContact = undefined;
+          if (transportEpoch >= 0 && changedEpoch) {
+            observer?.disconnected();
+          }
+        }
+        transportEpoch = epoch;
+        this.fsm.handleTransportConnectedChange(healthy, changedEpoch);
+      },
     );
-
-    this.applySnapshot(this.fsm.getSnapshot());
   }
 
   async handleCurrentDoorStateGet(): Promise<CharacteristicValue> {
@@ -137,356 +162,81 @@ export class GateAccessory {
     return snapshot.targetDoorState;
   }
 
-  async handleTargetDoorStateSet(value: CharacteristicValue) {
-    const target = Number(value) === DoorTargetState.OPEN ? 'open' : 'closed';
-    try {
-      await this.fsm.requestHomeKitTarget(target);
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      this.platform.log.warn(`Gate ${this.accessory.displayName} command failed: ${message}`);
+  async handleTargetDoorStateSet(value: CharacteristicValue): Promise<void> {
+    if (this.pendingContact !== undefined || (value !== DoorTargetState.OPEN && value !== DoorTargetState.CLOSED)) {
       throw this.createCommunicationError();
+    }
+    try {
+      await this.fsm.requestHomeKitTarget(value === DoorTargetState.OPEN ? 'open' : 'closed');
+    } catch (error) {
+      this.platform.log.warn(`Gate ${this.accessory.displayName} command rejected: ${(error as Error).message}`);
+      throw this.createCommunicationError();
+    } finally {
+      // HAP stores the written value after onSet resolves. Restore any synchronous terminal result afterwards.
+      if (this.reportingImmediate) {
+        clearImmediate(this.reportingImmediate);
+      }
+      this.reportingImmediate = setImmediate(() => {
+        this.reportingImmediate = undefined;
+        this.applySnapshot(this.fsm.getSnapshot());
+      });
     }
   }
 
-  async handleObstructionDetectedGet(): Promise<CharacteristicValue> {
-    return false;
+  private observeContact(closed: boolean, packet: IPublishPacket, debounceMs: number): void {
+    const metadata: ContactMetadata = {
+      retained: Boolean(packet.retain), receivedAt: gateClock.now(), epoch: this.fsm.getSnapshot().observationEpoch,
+    };
+    if (metadata.retained && this.fsm.getSnapshot().activeRequest) {
+      return;
+    }
+    if (this.pendingContact === closed) {
+      return;
+    }
+    this.clearDebounce();
+    if (closed === this.lastContact || debounceMs === 0) {
+      this.lastContact = closed;
+      this.fsm.handleClosedSensorChange(closed, metadata);
+      return;
+    }
+    if (this.lastContact !== undefined && !metadata.retained) {
+      this.fsm.handleContactTransition();
+    }
+    this.pendingContact = closed;
+    this.debounceTimer = setTimeout(() => {
+      this.debounceTimer = undefined;
+      this.pendingContact = undefined;
+      this.lastContact = closed;
+      if (!this.disposed) {
+        this.fsm.handleClosedSensorChange(closed, metadata);
+      }
+    }, debounceMs);
+  }
+
+  private clearDebounce(): void {
+    if (this.debounceTimer !== undefined) {
+      clearTimeout(this.debounceTimer);
+      this.debounceTimer = undefined;
+    }
+    this.pendingContact = undefined;
   }
 
   private applySnapshot(snapshot: FrontGateSnapshot): void {
-    if (this.service.testCharacteristic(this.platform.Characteristic.StatusActive)) {
-      this.service.updateCharacteristic(this.platform.Characteristic.StatusActive, snapshot.available);
-    }
-    if (this.service.testCharacteristic(this.platform.Characteristic.StatusFault)) {
-      this.service.updateCharacteristic(
-        this.platform.Characteristic.StatusFault,
-        snapshot.available
-          ? this.platform.Characteristic.StatusFault.NO_FAULT
-          : this.platform.Characteristic.StatusFault.GENERAL_FAULT,
-      );
-    }
-
-    this.service.updateCharacteristic(this.platform.Characteristic.ObstructionDetected, false);
-
-    if (!snapshot.available || snapshot.currentDoorState === undefined || snapshot.targetDoorState === undefined) {
-      const error = this.createCommunicationError();
-      this.service.updateCharacteristic(this.platform.Characteristic.CurrentDoorState, error);
-      this.service.updateCharacteristic(this.platform.Characteristic.TargetDoorState, error);
+    if (this.disposed) {
       return;
     }
-
+    // Reporting never invokes the target SET handler. STOPPED also represents unknown motion.
+    this.service.updateCharacteristic(this.platform.Characteristic.ObstructionDetected, false);
+    if (!snapshot.available || snapshot.currentDoorState === undefined || snapshot.targetDoorState === undefined) {
+      this.service.updateCharacteristic(this.platform.Characteristic.CurrentDoorState, this.createCommunicationError());
+      this.service.updateCharacteristic(this.platform.Characteristic.TargetDoorState, this.createCommunicationError());
+      return;
+    }
     this.service.updateCharacteristic(this.platform.Characteristic.CurrentDoorState, snapshot.currentDoorState);
     this.service.updateCharacteristic(this.platform.Characteristic.TargetDoorState, snapshot.targetDoorState);
   }
 
   private createCommunicationError(): Error {
-    return new Error('Front gate controller is unavailable');
-  }
-
-  private async publishPulse(reason: string): Promise<void> {
-    const action = this.platform.getFrontGatePulseAction();
-    if (!action) {
-      throw new Error('front gate pulse action is not configured');
-    }
-
-    this.platform.log.debug(`Publishing ${this.controlBaseTopic}/execute_action = ${action} (${reason})`);
-    this.noteExpectedSelfCommandEcho(action);
-
-    return new Promise<void>((resolve, reject) => {
-      this.platform.publishCommand(`${this.controlBaseTopic}/execute_action`, action, (error) => {
-        if (error) {
-          this.retractExpectedSelfCommandEcho(action);
-          reject(error);
-          return;
-        }
-        resolve();
-      });
-    });
-  }
-
-  private noteExpectedSelfCommandEcho(payload: string): void {
-    this.prunePendingSelfCommandEcho();
-    this.pendingSelfCommandEchoPayload = payload;
-    this.pendingSelfCommandEchoCount += 1;
-    this.pendingSelfCommandEchoExpiresAt = Date.now() + 2000;
-  }
-
-  private retractExpectedSelfCommandEcho(payload: string): void {
-    this.prunePendingSelfCommandEcho();
-    if (this.pendingSelfCommandEchoPayload !== payload || this.pendingSelfCommandEchoCount <= 0) {
-      return;
-    }
-
-    this.pendingSelfCommandEchoCount -= 1;
-    if (this.pendingSelfCommandEchoCount <= 0) {
-      this.pendingSelfCommandEchoCount = 0;
-      this.pendingSelfCommandEchoPayload = undefined;
-      this.pendingSelfCommandEchoExpiresAt = 0;
-    }
-  }
-
-  private shouldIgnoreObservedExecuteAction(payload: string): boolean {
-    this.prunePendingSelfCommandEcho();
-    if (this.pendingSelfCommandEchoPayload !== payload || this.pendingSelfCommandEchoCount <= 0) {
-      return false;
-    }
-
-    this.pendingSelfCommandEchoCount -= 1;
-    if (this.pendingSelfCommandEchoCount <= 0) {
-      this.pendingSelfCommandEchoCount = 0;
-      this.pendingSelfCommandEchoPayload = undefined;
-      this.pendingSelfCommandEchoExpiresAt = 0;
-    }
-    return true;
-  }
-
-  private prunePendingSelfCommandEcho(): void {
-    if (this.pendingSelfCommandEchoCount === 0) {
-      return;
-    }
-    if (Date.now() <= this.pendingSelfCommandEchoExpiresAt) {
-      return;
-    }
-
-    this.pendingSelfCommandEchoCount = 0;
-    this.pendingSelfCommandEchoPayload = undefined;
-    this.pendingSelfCommandEchoExpiresAt = 0;
-  }
-
-  private resolveSensorBaseTopic(): string {
-    const explicit = this.resolveSensorOverrideFromConfig();
-    if (explicit) {
-      this.platform.log.info(
-        `[FrontGate ${this.accessory.displayName}] using explicit front-gate sensor topic override: ${explicit}`,
-      );
-      return explicit;
-    }
-
-    const candidates = this.findSensorCandidates();
-    if (candidates.length === 0) {
-      this.platform.log.warn(
-        `[FrontGate ${this.accessory.displayName}] no dedicated gate sensor channel found; falling back to ${this.controlBaseTopic}/state/hi`,
-      );
-      return this.controlBaseTopic;
-    }
-
-    const winner = candidates[0];
-    this.platform.log.info(
-      `[FrontGate ${this.accessory.displayName}] resolved sensor channel ${winner.channel.channelCaption} `
-      + `(${winner.channel.deviceId}/${winner.channel.channelId}) -> ${winner.baseTopic} `
-      + `[${winner.reasons.join(', ')}]`,
-    );
-    return winner.baseTopic;
-  }
-
-  private resolveSensorOverrideFromConfig(): string | undefined {
-    const config = this.platform.config as unknown as FrontGateConfigView;
-
-    if (typeof config.frontGateSensorTopic === 'string' && config.frontGateSensorTopic.trim()) {
-      return this.platform.normalizeTopicBase(config.frontGateSensorTopic);
-    }
-
-    const requestedDeviceId = this.normalizeOptionalId(config.frontGateSensorDeviceId);
-    const requestedChannelId = this.normalizeOptionalId(config.frontGateSensorChannelId);
-    if (!requestedDeviceId && !requestedChannelId) {
-      return undefined;
-    }
-
-    const channel = this.collectKnownChannels().find(candidate => {
-      if (requestedDeviceId && candidate.deviceId !== requestedDeviceId) {
-        return false;
-      }
-      if (requestedChannelId && candidate.channelId !== requestedChannelId) {
-        return false;
-      }
-      return true;
-    });
-
-    if (!channel) {
-      this.platform.log.warn(
-        `[FrontGate ${this.accessory.displayName}] configured frontGateSensorDeviceId/frontGateSensorChannelId did not match any known channel`,
-      );
-      return undefined;
-    }
-
-    return this.platform.normalizeTopicBase(channel.topic);
-  }
-
-  private findSensorCandidates(): SensorCandidate[] {
-    const channels = this.collectKnownChannels();
-    const candidates: SensorCandidate[] = [];
-
-    for (const channel of channels) {
-      if (channel.channelId === this.context.channelId && channel.deviceId === this.context.deviceId) {
-        continue;
-      }
-
-      const score = this.scoreSensorCandidate(channel);
-      if (score.score <= 0) {
-        continue;
-      }
-
-      candidates.push({
-        channel,
-        baseTopic: this.platform.normalizeTopicBase(channel.topic),
-        score: score.score,
-        reasons: score.reasons,
-      });
-    }
-
-    candidates.sort((left, right) => right.score - left.score);
-    return candidates;
-  }
-
-  private scoreSensorCandidate(channel: SuplaChannelContext): { score: number; reasons: string[] } {
-    const reasons: string[] = [];
-    let score = 0;
-
-    const functionName = (channel.channelFunction || '').toUpperCase();
-    const typeName = (channel.channelType || '').toUpperCase();
-
-    const isGateSensorFunction = functionName === 'OPENINGSENSOR_GATE' || functionName === 'OPENINGSENSOR_GATEWAY';
-    const isGenericOpeningSensor = functionName.startsWith('OPENINGSENSOR_');
-    const isBinarySensor = typeName === 'BINARYSENSOR';
-    const sameDevice = Boolean(channel.deviceId && channel.deviceId === this.context.deviceId);
-    const captionScore = this.computeCaptionSimilarity(
-      this.context.channelCaption || this.accessory.displayName,
-      channel.channelCaption || '',
-    );
-
-    if (isGateSensorFunction) {
-      score += 100;
-      reasons.push('gate-sensor-function');
-    } else if (isGenericOpeningSensor) {
-      score += 70;
-      reasons.push('opening-sensor-function');
-    } else if (isBinarySensor) {
-      if (!sameDevice && captionScore === 0) {
-        return { score: 0, reasons: [] };
-      }
-      score += 20;
-      reasons.push('binary-sensor');
-    } else {
-      return { score: 0, reasons: [] };
-    }
-
-    if (sameDevice) {
-      score += 50;
-      reasons.push('same-device');
-    }
-
-    if (captionScore > 0) {
-      score += captionScore;
-      reasons.push(`caption+${captionScore}`);
-    }
-
-    const controlBase = this.platform.normalizeTopicBase(this.context.topic);
-    const candidateBase = this.platform.normalizeTopicBase(channel.topic);
-    if (controlBase && candidateBase && controlBase !== candidateBase) {
-      const controlPrefix = controlBase.replace(/\/channels\/[^/]+$/, '');
-      const candidatePrefix = candidateBase.replace(/\/channels\/[^/]+$/, '');
-      if (controlPrefix === candidatePrefix) {
-        score += 15;
-        reasons.push('same-device-topic-prefix');
-      }
-    }
-
-    return { score, reasons };
-  }
-
-  private computeCaptionSimilarity(left: string, right: string): number {
-    const leftTokens = this.tokenizeCaption(left);
-    const rightTokens = this.tokenizeCaption(right);
-
-    if (leftTokens.length === 0 || rightTokens.length === 0) {
-      return 0;
-    }
-
-    const rightSet = new Set(rightTokens);
-    let overlap = 0;
-    for (const token of leftTokens) {
-      if (rightSet.has(token)) {
-        overlap += 1;
-      }
-    }
-
-    if (overlap === 0) {
-      return 0;
-    }
-
-    return Math.min(40, overlap * 10);
-  }
-
-  private tokenizeCaption(value: string): string[] {
-    return value
-      .toLowerCase()
-      .normalize('NFD')
-      .replace(/[\u0300-\u036f]/g, '')
-      .split(/[^a-z0-9]+/)
-      .filter(Boolean)
-      .filter(token => !new Set([
-        'gate',
-        'sensor',
-        'contact',
-        'opening',
-        'open',
-        'close',
-        'controller',
-      ]).has(token));
-  }
-
-  private normalizeOptionalId(value: string | number | undefined): string | undefined {
-    if (value === undefined || value === null) {
-      return undefined;
-    }
-    const normalized = String(value).trim();
-    return normalized || undefined;
-  }
-
-  private collectKnownChannels(): SuplaChannelContext[] {
-    const byKey = new Map<string, SuplaChannelContext>();
-    const push = (candidate: unknown) => {
-      if (!candidate || typeof candidate !== 'object') {
-        return;
-      }
-
-      const channel = candidate as Partial<SuplaChannelContext>;
-      if (typeof channel.topic !== 'string') {
-        return;
-      }
-
-      const key = [
-        channel.deviceId ?? '',
-        channel.channelId ?? '',
-        this.platform.normalizeTopicBase(channel.topic),
-      ].join('|');
-
-      byKey.set(key, channel as SuplaChannelContext);
-    };
-
-    for (const knownAccessory of this.platform.accessories) {
-      push(knownAccessory.context.device);
-    }
-
-    const config = this.platform.config as unknown as FrontGateConfigView;
-    const rawChannels = config.channels;
-    if (Array.isArray(rawChannels)) {
-      for (const channel of rawChannels) {
-        push(channel);
-      }
-    } else if (typeof rawChannels === 'string' && rawChannels.trim()) {
-      try {
-        const parsed = JSON.parse(rawChannels);
-        if (Array.isArray(parsed)) {
-          for (const channel of parsed) {
-            push(channel);
-          }
-        }
-      } catch (error) {
-        const message = error instanceof Error ? error.message : String(error);
-        this.platform.log.warn(`[FrontGate ${this.accessory.displayName}] failed to parse cached channels: ${message}`);
-      }
-    }
-
-    return Array.from(byKey.values());
+    return new this.platform.api.hap.HapStatusError(this.platform.api.hap.HAPStatus.SERVICE_COMMUNICATION_FAILURE);
   }
 }

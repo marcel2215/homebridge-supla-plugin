@@ -1,813 +1,592 @@
-export type GateTarget = 'open' | 'closed';
-export type MotionDirection = 'opening' | 'closing';
-export type MotionCertainty = 'known' | 'goalOnly';
-export type MotionSource = 'homekit' | 'external' | 'recovery';
-export type IdleNotClosedMode = 'openKnown' | 'openishUnknown';
-export type NextPulseDirection = MotionDirection | 'unknown';
+import { randomUUID } from 'node:crypto';
+import {
+  applyEstimatedPulse, canStopBeforeEndpoint, GateEstimate, GateTarget, MotionDirection,
+  positionAt, startMotion, targetDirection, unknownEstimate,
+} from './GateEstimator';
+import { DEFAULT_FRONT_GATE_TIMINGS, FrontGateTimingConfig, normalizeFrontGateTimings } from './FrontGateConfig';
 
-export const enum DoorCurrentState {
-  OPEN = 0,
-  CLOSED = 1,
-  OPENING = 2,
-  CLOSING = 3,
-  STOPPED = 4,
+export { DEFAULT_FRONT_GATE_TIMINGS, FrontGateTimingConfig } from './FrontGateConfig';
+export { GateTarget, MotionDirection } from './GateEstimator';
+export enum DoorCurrentState { OPEN = 0, CLOSED = 1, OPENING = 2, CLOSING = 3, STOPPED = 4 }
+export enum DoorTargetState { OPEN = 0, CLOSED = 1 }
+
+export interface GateClock {
+  now(): number;
+  setTimeout(callback: () => void, ms: number): ReturnType<typeof setTimeout>;
+  clearTimeout(timer: ReturnType<typeof setTimeout>): void;
 }
-
-export const enum DoorTargetState {
-  OPEN = 0,
-  CLOSED = 1,
-}
-
-export interface FrontGateTimingConfig {
-  fullTravelMs: number;
-  reversePauseMs: number;
-  wrongDirectionRunMs: number;
-  minimumPulseGapMs: number;
-  closeRetryLimit: number;
-}
-
-export const DEFAULT_FRONT_GATE_TIMINGS: FrontGateTimingConfig = {
-  fullTravelMs: 25000,
-  reversePauseMs: 3000,
-  wrongDirectionRunMs: 0,
-  minimumPulseGapMs: 3000,
-  closeRetryLimit: 0,
+export const gateClock: GateClock = {
+  now: () => performance.now(),
+  setTimeout: (callback, ms) => setTimeout(callback, ms),
+  clearTimeout: timer => clearTimeout(timer),
 };
-
-export interface PersistedFrontGateState {
-  // Intentionally empty.
-  // The front gate controller does NOT persist motion/direction state because
-  // Supla app / IR remote / HomeKit can invalidate it at any time.
-}
-
-export interface FrontGateSnapshot {
-  available: boolean;
-  controlConnected: boolean | null;
-  sensorConnected: boolean | null;
-  closedSensor: boolean | null;
-  sensorFreshSinceOnline: boolean;
-  currentDoorState?: DoorCurrentState;
-  targetDoorState?: DoorTargetState;
-  requestedTarget: GateTarget | null;
-  motionDirection: MotionDirection | 'none';
-  motionCertainty: MotionCertainty | 'none';
-  planKind: Plan['kind'];
-  idleNotClosedMode: IdleNotClosedMode;
-  nextPulseDirection: NextPulseDirection;
-  note: string;
-}
-
 export interface FrontGateLogger {
   debug(message: string): void;
   info(message: string): void;
   warn(message: string): void;
 }
-
+export interface GatePulseEffect {
+  requestId: number;
+  stepId: number;
+  generation: number;
+  correlationId: string;
+}
 export interface FrontGateIo {
-  pulseMotor(reason: string): Promise<void>;
+  // Resolution means publication handling, never motor execution.
+  pulseMotor(reason: string, effect: GatePulseEffect): Promise<void>;
   publishSnapshot(snapshot: FrontGateSnapshot): void;
   log: FrontGateLogger;
 }
-
-type Plan =
-  | { kind: 'idle' }
-  | {
-      kind: 'moving';
-      direction: MotionDirection;
-      certainty: MotionCertainty;
-      source: MotionSource;
-      startedAt: number;
-      deadlineAt: number;
-    }
-  | {
-      kind: 'waitingSecondPulse';
-      stoppedFrom: MotionDirection;
-      finalDirection: MotionDirection;
-      source: MotionSource;
-      dueAt: number;
-      deadlineAt: number;
-      reason: 'reverseToOpen' | 'reverseToClose';
-    };
-
-function delay(ms: number): Promise<void> {
-  return new Promise(resolve => setTimeout(resolve, ms));
+export type RequestOutcome = 'confirmed' | 'estimated' | 'unconfirmed' | 'failed' | 'cancelled' | 'rejected';
+type PulseStep = 'start-opening' | 'start-closing' | 'stop-opening' | 'stop-closing' | 'unknown';
+type RequestPhase = 'waiting' | 'publishing' | 'observing';
+export interface GateRequestResult {
+  id: number;
+  target: GateTarget;
+  attempts: number;
+  pulseBudget: number;
+  outcome: RequestOutcome;
+  reason: string;
+  endedAt: number;
 }
-
-function clampInt(value: number, min: number, max: number): number {
-  if (!Number.isFinite(value)) {
-    return min;
-  }
-  return Math.min(max, Math.max(min, Math.round(value)));
+type ActiveRequest = {
+  id: number;
+  target: GateTarget;
+  generation: number;
+  plan: readonly PulseStep[];
+  attempts: number;
+  nextStep: number;
+  phase: RequestPhase;
+  deadline: number;
+};
+export interface FrontGateSnapshot {
+  available: boolean;
+  transportConnected: boolean;
+  controlConnected: boolean | null;
+  sensorConnected: boolean | null;
+  closedSensor: boolean | null;
+  sensorFreshSinceOnline: boolean;
+  observationEpoch: number;
+  currentDoorState?: DoorCurrentState;
+  targetDoorState?: DoorTargetState;
+  requestedTarget: GateTarget | null;
+  estimate: GateEstimate;
+  position: { min: number; max: number };
+  nextPulseDirection: MotionDirection | 'stop' | 'unknown';
+  activeRequest: {
+    id: number; target: GateTarget; attempts: number; pulseBudget: number; phase: RequestPhase; deadline: number;
+  } | null;
+  lastResult: GateRequestResult | null;
+  note: string;
 }
-
-function oppositeDirection(direction: MotionDirection): MotionDirection {
-  return direction === 'opening' ? 'closing' : 'opening';
+export interface ContactMetadata {
+  retained?: boolean;
+  // Monotonic receive time is not a measurement timestamp.
+  receivedAt?: number;
+  epoch?: number;
+  stale?: boolean;
 }
+export class GateNotSentError extends Error {}
 
+/** Estimates outlive requests. Only requestHomeKitTarget may create an actuator plan. */
 export class FrontGateFsm {
-  private readonly travelMs: number;
+  private readonly instanceId = randomUUID();
+  private readonly timings: FrontGateTimingConfig;
   private readonly pulseGapMs: number;
-
-  private facts: {
-    controlConnected: boolean | null;
-    sensorConnected: boolean | null;
-    closedSensor: boolean | null;
-  } = {
-    controlConnected: null,
-    sensorConnected: null,
-    closedSensor: null,
-  };
-
+  private transportConnected = false;
+  private controlConnected: boolean | null = null;
+  private sensorConnected: boolean | null = null;
+  private closedSensor: boolean | null = null;
   private sensorFreshSinceOnline = false;
-  private requestedTarget: GateTarget | null = null;
-  private idleNotClosedMode: IdleNotClosedMode = 'openishUnknown';
-  private idleNextPulseDirection: NextPulseDirection = 'unknown';
-  private plan: Plan = { kind: 'idle' };
-  private lastPulseLikeActivityAt = 0;
+  private observationEpoch = 0;
+  private generation = 0;
+  private nextRequestId = 0;
+  private activeRequest?: ActiveRequest;
+  private lastResult: GateRequestResult | null = null;
+  private estimate: GateEstimate = unknownEstimate();
+  private lastPossibleActuationAt = -Infinity;
+  private lastContactAt = -Infinity;
+  private contactRevision = 0;
+  private lastLocalEffect?: GatePulseEffect & { attemptedAt: number; observed: boolean };
   private movementTimer?: ReturnType<typeof setTimeout>;
-  private movementTimerToken = 0;
-  private phaseTimer?: ReturnType<typeof setTimeout>;
-  private phaseTimerToken = 0;
-  private sequence = Promise.resolve<void>(undefined);
+  private stepTimer?: ReturnType<typeof setTimeout>;
+  private publishTimer?: ReturnType<typeof setTimeout>;
+  private requestTimer?: ReturnType<typeof setTimeout>;
   private disposed = false;
 
   public constructor(
     private readonly io: FrontGateIo,
-    timings: FrontGateTimingConfig = DEFAULT_FRONT_GATE_TIMINGS,
-    _persisted: PersistedFrontGateState = {},
+    timings: Partial<FrontGateTimingConfig> = DEFAULT_FRONT_GATE_TIMINGS,
+    private readonly clock: GateClock = gateClock,
   ) {
-    this.travelMs = clampInt(timings.fullTravelMs || DEFAULT_FRONT_GATE_TIMINGS.fullTravelMs, 5000, 120000);
+    this.timings = normalizeFrontGateTimings(timings, message => io.log.warn(message));
     this.pulseGapMs = Math.max(
-      3000,
-      clampInt(timings.minimumPulseGapMs || DEFAULT_FRONT_GATE_TIMINGS.minimumPulseGapMs, 0, 15000),
-      clampInt(timings.reversePauseMs || DEFAULT_FRONT_GATE_TIMINGS.reversePauseMs, 0, 15000),
+      this.timings.minimumPulseGapMs, this.timings.reversePauseMs,
+      this.timings.relayHighMs + this.timings.relayReleaseMarginMs + this.timings.actuationDelayMs,
     );
-
-    this.emitSnapshot('fsm-initialized');
+    this.emitSnapshot('initialized');
   }
 
   public dispose(): void {
+    this.finishRequest('cancelled', 'disposed');
+    this.setEstimate(unknownEstimate());
     this.disposed = true;
-    this.clearTimers();
   }
 
-  public handleConnectedChange(connected: boolean): void {
-    this.handleControlConnectedChange(connected);
+  public handleTransportConnectedChange(connected: boolean, resetEpoch = false): void {
+    if (this.disposed || (this.transportConnected === connected && !resetEpoch)) {
+      return;
+    }
+    this.transportConnected = connected;
+    if (!connected) {
+      this.controlConnected = null;
+      this.sensorConnected = null;
+      this.loseObservations('transport-or-subscription-lost');
+    } else {
+      // Retained baselines may precede SUBACK/connected packets in the same epoch.
+      this.emitSnapshot('transport-ready');
+    }
   }
 
   public handleControlConnectedChange(connected: boolean): void {
-    void this.enqueue(`control-connected=${connected}`, () => {
-      this.applyControlConnectedChange(connected);
-    });
+    if (this.disposed || this.controlConnected === connected) {
+      return;
+    }
+    this.controlConnected = connected;
+    if (!connected) {
+      this.loseObservations('control-offline');
+    } else {
+      this.emitSnapshot('control-online');
+    }
   }
 
   public handleSensorConnectedChange(connected: boolean): void {
-    void this.enqueue(`sensor-connected=${connected}`, () => {
-      this.applySensorConnectedChange(connected);
-    });
+    if (this.disposed || this.sensorConnected === connected) {
+      return;
+    }
+    this.sensorConnected = connected;
+    if (!connected) {
+      this.loseObservations('sensor-offline');
+    } else {
+      this.emitSnapshot('sensor-online');
+    }
   }
 
-  public handleClosedSensorChange(closed: boolean): void {
-    void this.enqueue(`closed-sensor=${closed}`, () => {
-      this.applyClosedSensorChange(closed);
-    });
+  public handleInvalidContact(): void {
+    if (!this.disposed) {
+      this.loseObservations('invalid-contact');
+    }
   }
 
-  public handleObservedExternalPulse(reason = 'mqtt-execute_action'): void {
-    void this.enqueue(`external-pulse=${reason}`, () => {
-      this.applyObservedExternalPulse(reason);
-    });
+  /** Block a pending reversal immediately while the adapter debounces a contact edge. */
+  public handleContactTransition(): void {
+    const request = this.activeRequest;
+    if (request && request.nextStep < request.plan.length) {
+      this.finishRequest('cancelled', 'contact-transition-during-plan');
+      this.setEstimate(unknownEstimate());
+      this.emitSnapshot('contact-transition-during-plan');
+    }
   }
 
+  public handleClosedSensorChange(closed: boolean, metadata: ContactMetadata = {}): void {
+    const now = this.clock.now();
+    const receivedAt = metadata.receivedAt ?? now;
+    if (this.disposed || metadata.stale || (metadata.epoch !== undefined && metadata.epoch !== this.observationEpoch)
+      || !Number.isFinite(receivedAt) || receivedAt < this.lastContactAt || receivedAt > now
+      || this.controlConnected === false || this.sensorConnected === false) {
+      return;
+    }
+    if (metadata.retained && (this.sensorFreshSinceOnline || this.activeRequest
+      || this.estimate.kind === 'moving' || this.estimate.kind === 'stopped')) {
+      return;
+    }
+    const previous = this.closedSensor;
+    const wasFresh = this.sensorFreshSinceOnline;
+    if (closed && previous === true && this.estimate.kind === 'moving' && this.estimate.direction === 'opening'
+      && receivedAt - this.estimate.startedAt < this.timings.departureGraceMs) {
+      return;
+    }
+    this.closedSensor = closed;
+    this.contactRevision += 1;
+    this.lastContactAt = receivedAt;
+    this.sensorFreshSinceOnline = true;
+    if (closed) {
+      this.setEstimate({ kind: 'closed', evidence: 'contact-confirmed' });
+      const target = this.activeRequest?.target;
+      this.finishRequest(target === 'closed' ? 'confirmed' : 'failed', target === 'closed' ? 'closed-contact' : 'target-mismatch-closed');
+      // CLOSED is a terminal barrier, including when OPEN was requested.
+      this.generation += 1;
+      this.emitSnapshot('closed-contact');
+      return;
+    }
+    if (wasFresh && previous === true && !metadata.retained) {
+      if (this.estimate.kind === 'moving' && this.estimate.direction === 'opening') {
+        this.setEstimate({ ...this.estimate, evidence: 'departure-observed' });
+      } else if (this.estimate.kind === 'closed') {
+        this.lastPossibleActuationAt = now;
+        this.finishRequest('cancelled', 'external-departure');
+        const maximumDeparturePosition = Math.min(1,
+          this.timings.sensorDelayMs / (this.timings.openingTravelMs * (1 - this.timings.travelUncertainty)),
+        );
+        this.setEstimate(startMotion(
+          { min: 0, max: maximumDeparturePosition }, 'opening', receivedAt, this.timings, 'departure-observed', 0,
+        ));
+      } else {
+        this.finishRequest('cancelled', 'unexpected-contact-release');
+        this.setEstimate(unknownEstimate());
+      }
+    } else if (!wasFresh || this.estimate.kind === 'closed') {
+      this.setEstimate(unknownEstimate());
+    }
+    this.emitSnapshot('not-closed-contact');
+  }
+
+  public handleCommandIntent(origin: 'external' | 'ambiguous', reason = 'mqtt-intent'): void {
+    if (this.disposed) {
+      return;
+    }
+    this.lastPossibleActuationAt = this.clock.now();
+    this.finishRequest('cancelled', `${origin}-${reason}`);
+    this.generation += 1;
+    this.setEstimate(unknownEstimate());
+    this.emitSnapshot(`${origin}-${reason}`);
+  }
+
+  public handleObservationGap(reason = 'observer-gap'): void {
+    this.handleCommandIntent('ambiguous', reason);
+  }
+
+  /** Genuinely observed motor-input edges only; raw MQTT intents must never call this. */
+  public handleAppliedPulse(correlationId?: string, occurredAt = this.clock.now()): void {
+    if (this.disposed) {
+      return;
+    }
+    const now = this.clock.now();
+    if (correlationId && correlationId === this.lastLocalEffect?.correlationId) {
+      if (this.lastLocalEffect.observed || this.lastLocalEffect.generation !== this.generation) {
+        return;
+      }
+      if (occurredAt < this.lastLocalEffect.attemptedAt || occurredAt > this.lastLocalEffect.attemptedAt + this.timings.actuationDelayMs
+        || occurredAt > now || now - occurredAt > 250) {
+        this.handleObservationGap('own-relay-edge-outside-timing-window');
+        return;
+      }
+      this.lastLocalEffect.observed = true;
+      this.lastPossibleActuationAt = now;
+      if (this.estimate.kind !== 'unknown' && this.estimate.kind !== 'closed') {
+        this.setEstimate({ ...this.estimate, evidence: 'relay-observed' });
+        this.emitSnapshot('own-relay-edge');
+      }
+      return;
+    }
+    const previousPossibleActuationAt = this.lastPossibleActuationAt;
+    this.lastPossibleActuationAt = now;
+    const inFlight = this.activeRequest?.phase === 'publishing';
+    this.finishRequest('cancelled', 'external-relay-edge');
+    this.generation += 1;
+    const overlapsDeparture = this.estimate.kind === 'moving' && this.estimate.evidence === 'departure-observed'
+      && occurredAt <= this.estimate.startedAt;
+    if (!this.isAvailable() || inFlight || occurredAt > now || now - occurredAt > 250
+      || occurredAt < previousPossibleActuationAt || overlapsDeparture) {
+      this.setEstimate(unknownEstimate());
+    } else {
+      this.setEstimate(applyEstimatedPulse(this.estimate, occurredAt, this.timings, 'relay-observed', 0));
+    }
+    this.emitSnapshot('external-relay-edge');
+  }
+
+  /** Finite SET response: resolve on acceptance; subsequent publication/travel results use snapshots. */
   public async requestHomeKitTarget(target: GateTarget): Promise<void> {
-    return this.enqueue(`homekit-target=${target}`, async () => {
-      await this.applyHomeKitTarget(target);
-    });
+    if (this.disposed) {
+      throw new Error('front gate controller is disposed');
+    }
+    this.expireMovement();
+    if (this.activeRequest?.target === target) {
+      return;
+    }
+    if (this.activeRequest?.phase === 'publishing') {
+      this.setEstimate(unknownEstimate());
+    }
+    this.finishRequest('cancelled', 'superseded');
+    const id = ++this.nextRequestId;
+    let plan: readonly PulseStep[];
+    try {
+      if (!this.isAvailable()) {
+        throw new Error('front gate controller is unavailable');
+      }
+      plan = this.planRequest(target);
+    } catch (error) {
+      this.lastResult = {
+        id, target, attempts: 0, pulseBudget: 0, outcome: 'rejected', endedAt: this.clock.now(), reason: (error as Error).message,
+      };
+      this.io.log.warn(`gate request ${JSON.stringify(this.lastResult)}`);
+      this.emitSnapshot('request-rejected');
+      throw error;
+    }
+    const maximumTravel = Math.max(this.timings.openingTravelMs, this.timings.closingTravelMs) * (1 + this.timings.travelUncertainty);
+    const deadline = this.clock.now() + maximumTravel + this.timings.actuationDelayMs
+      + this.timings.sensorDelayMs + this.timings.sensorDebounceMs
+      + (plan.length + 1) * (this.pulseGapMs + this.timings.publishTimeoutMs);
+    const request: ActiveRequest = {
+      id, target, generation: ++this.generation, plan: Object.freeze([...plan]), attempts: 0, nextStep: 0, phase: 'waiting', deadline,
+    };
+    this.activeRequest = request;
+    this.requestTimer = this.clock.setTimeout(() => {
+      if (this.isCurrent(request)) {
+        this.setEstimate(unknownEstimate());
+        this.finishRequest('unconfirmed', 'request-deadline');
+      }
+    }, deadline - this.clock.now());
+    if (!plan.length) {
+      if (this.estimate.kind === 'closed' || this.estimate.kind === 'open') {
+        this.finishRequest(this.estimate.kind === 'closed' ? 'confirmed' : 'estimated', 'already-at-target');
+      } else {
+        request.phase = 'observing';
+      }
+    } else {
+      this.scheduleStep(request);
+    }
+    this.emitSnapshot('request-accepted');
   }
 
   public getSnapshot(): FrontGateSnapshot {
-    return this.buildSnapshot('snapshot-requested');
-  }
-
-  private enqueue(label: string, task: () => Promise<void> | void): Promise<void> {
-    if (this.disposed) {
-      return Promise.resolve();
-    }
-
-    const run = this.sequence.then(async () => {
-      if (this.disposed) {
-        return;
-      }
-      await task();
-    });
-
-    this.sequence = run.catch(error => {
-      const message = error instanceof Error ? error.message : String(error);
-      this.io.log.warn(`front-gate sequence '${label}' failed: ${message}`);
-    });
-
-    return run;
-  }
-
-  private applyControlConnectedChange(connected: boolean): void {
-    if (this.facts.controlConnected === connected) {
-      return;
-    }
-
-    this.facts.controlConnected = connected;
-
-    if (!connected) {
-      this.io.log.warn('front gate control channel went offline');
-      this.enterUnavailable('control-offline');
-      return;
-    }
-
-    this.io.log.info('front gate control channel connected');
-    this.clearTimers();
-    this.plan = { kind: 'idle' };
-    this.sensorFreshSinceOnline = false;
-    this.emitSnapshot('control-online-awaiting-fresh-sensor');
-  }
-
-  private applySensorConnectedChange(connected: boolean): void {
-    if (this.facts.sensorConnected === connected) {
-      return;
-    }
-
-    this.facts.sensorConnected = connected;
-
-    if (!connected) {
-      this.io.log.warn('front gate sensor channel went offline');
-      this.enterUnavailable('sensor-offline');
-      return;
-    }
-
-    this.io.log.info('front gate sensor channel connected');
-    this.clearTimers();
-    this.plan = { kind: 'idle' };
-    this.sensorFreshSinceOnline = false;
-    this.emitSnapshot('sensor-online-awaiting-fresh-state');
-  }
-
-  private applyClosedSensorChange(closed: boolean): void {
-    const previous = this.facts.closedSensor;
-    const wasFresh = this.sensorFreshSinceOnline;
-    this.facts.closedSensor = closed;
-
-    if (this.facts.controlConnected === true && this.facts.sensorConnected === true) {
-      this.sensorFreshSinceOnline = true;
-    }
-
-    const becameFresh = !wasFresh && this.sensorFreshSinceOnline;
-    if (previous === closed && !becameFresh) {
-      return;
-    }
-
-    if (closed) {
-      this.io.log.info('closed sensor is TRUE -> gate is fully closed');
-      this.clearTimers();
-      this.plan = { kind: 'idle' };
-      this.idleNextPulseDirection = 'opening';
-      this.idleNotClosedMode = 'openishUnknown';
-
-      if (this.requestedTarget === 'open' && this.isAvailableForHomeKit()) {
-        this.emitSnapshot('closed-sensor-true-but-open-still-requested');
-        void this.enqueue('auto-open-after-closed', async () => {
-          await this.startOpeningFromClosed('auto-open-after-closed');
-        });
-        return;
-      }
-
-      this.requestedTarget = null;
-      this.emitSnapshot('closed-sensor-true');
-      return;
-    }
-
-    this.io.log.info('closed sensor is FALSE -> gate is not fully closed');
-
-    if (previous === true) {
-      // Leaving the closed end-stop is the one fully reliable motion signal we have:
-      // the gate is opening.
-      this.lastPulseLikeActivityAt = Date.now();
-      if (this.requestedTarget !== 'open') {
-        this.requestedTarget = null;
-      }
-      this.startOpeningMotion(
-        this.requestedTarget === 'open' ? 'homekit' : 'external',
-        'closed-sensor-fell-from-true-to-false',
-      );
-      return;
-    }
-
-    if (this.plan.kind === 'idle' && this.requestedTarget === 'open') {
-      this.requestedTarget = null;
-    }
-
-    this.emitSnapshot('closed-sensor-false');
-  }
-
-  private async applyHomeKitTarget(target: GateTarget): Promise<void> {
-    if (!this.isAvailableForHomeKit()) {
-      throw new Error('front gate controller is not available');
-    }
-
-    this.requestedTarget = target;
-
-    if (target === 'open') {
-      await this.handleOpenRequest();
-      return;
-    }
-
-    await this.handleCloseRequest();
-  }
-
-  private async handleOpenRequest(): Promise<void> {
-    if (this.facts.closedSensor === true) {
-      if (this.plan.kind === 'moving' && this.plan.direction === 'opening') {
-        this.emitSnapshot('open-request-already-opening-from-closed');
-        return;
-      }
-      if (this.plan.kind === 'waitingSecondPulse' && this.plan.finalDirection === 'opening') {
-        this.emitSnapshot('open-request-already-reversing-to-open');
-        return;
-      }
-
-      await this.startOpeningFromClosed('homekit-open-from-closed');
-      return;
-    }
-
-    if (this.plan.kind === 'moving') {
-      if (this.plan.direction === 'opening') {
-        this.emitSnapshot('open-request-already-opening');
-        return;
-      }
-
-      if (this.plan.certainty === 'known') {
-        await this.reverseKnownMotion('opening', 'homekit-reverse-known-closing-to-open');
-        return;
-      }
-
-      this.io.log.warn(
-        'open requested during ambiguous close attempt; not sending more pulses because the actual motion direction is unknown',
-      );
-      this.clearTimers();
-      this.plan = { kind: 'idle' };
-      this.idleNotClosedMode = 'openishUnknown';
-      this.idleNextPulseDirection = 'unknown';
-      this.requestedTarget = null;
-      this.emitSnapshot('open-request-during-ambiguous-close-attempt');
-      return;
-    }
-
-    if (this.plan.kind === 'waitingSecondPulse') {
-      if (this.plan.finalDirection === 'opening') {
-        this.emitSnapshot('open-request-already-reversing-to-open');
-        return;
-      }
-
-      // We already stopped an opening run, so the next pulse can only start closing.
-      // To honor the latest OPEN request without leaving the gate stopped in the middle,
-      // keep the pending close, let the gate reach the closed end-stop, then auto-open.
-      this.io.log.info(
-        'open requested while waiting to restart towards close; keeping the pending close and will auto-open from closed',
-      );
-      this.emitSnapshot('open-request-deferred-until-closed');
-      return;
-    }
-
-    if (this.idleNextPulseDirection === 'opening') {
-      await this.startOpeningFromStoppedState('homekit-open-from-stopped-after-closing');
-      return;
-    }
-
-    this.requestedTarget = null;
-    this.emitSnapshot('open-request-already-satisfied-openish');
-  }
-
-  private async handleCloseRequest(): Promise<void> {
-    if (this.facts.closedSensor === true) {
-      if (this.plan.kind === 'moving' && this.plan.direction === 'opening') {
-        // We are still physically on the closed end-stop, so a single pulse cleanly
-        // cancels the opening attempt and leaves the gate closed.
-        await this.pulseMotor('cancel-opening-while-still-closed');
-        this.clearTimers();
-        this.plan = { kind: 'idle' };
-        this.idleNextPulseDirection = 'opening';
-        this.requestedTarget = null;
-        this.emitSnapshot('opening-cancelled-before-leaving-closed');
-        return;
-      }
-
-      this.requestedTarget = null;
-      this.emitSnapshot('close-request-already-satisfied');
-      return;
-    }
-
-    if (this.plan.kind === 'moving') {
-      if (this.plan.direction === 'closing') {
-        this.emitSnapshot(
-          this.plan.certainty === 'known' ? 'close-request-already-closing' : 'close-request-already-close-seeking',
-        );
-        return;
-      }
-
-      await this.reverseKnownMotion('closing', 'homekit-reverse-known-opening-to-close');
-      return;
-    }
-
-    if (this.plan.kind === 'waitingSecondPulse') {
-      if (this.plan.finalDirection === 'closing') {
-        this.emitSnapshot('close-request-already-reversing-to-close');
-        return;
-      }
-
-      // We already stopped a closing run, so the next pulse can only start opening.
-      // To honor the latest CLOSE request without leaving the gate stopped in the middle,
-      // keep the pending open, let the gate become fully open-ish by timeout, then auto-close.
-      this.io.log.info(
-        'close requested while waiting to restart towards open; keeping the pending open and will auto-close after the opening run settles',
-      );
-      this.emitSnapshot('close-request-deferred-until-open');
-      return;
-    }
-
-    if (this.idleNotClosedMode === 'openKnown' || this.idleNextPulseDirection === 'closing') {
-      await this.startKnownCloseFromIdle('homekit-close-from-openish-known');
-      return;
-    }
-
-    if (this.idleNextPulseDirection === 'opening') {
-      this.io.log.warn(
-        'close requested while the gate is stopped after a closing run; the next pulse would open, so no corrective pulse is sent',
-      );
-      this.requestedTarget = null;
-      this.emitSnapshot('close-request-not-directly-actionable-from-stopped-closing');
-      return;
-    }
-
-    await this.startAmbiguousCloseAttempt('homekit-close-from-openish-ambiguous');
-  }
-
-  private async startOpeningFromClosed(reason: string): Promise<void> {
-    if (this.facts.closedSensor !== true) {
-      this.requestedTarget = null;
-      this.emitSnapshot(`${reason}-already-openish`);
-      return;
-    }
-
-    await this.pulseMotor(reason);
-    this.startOpeningMotion('homekit', `${reason}-pulse-sent`);
-  }
-
-  private async startOpeningFromStoppedState(reason: string): Promise<void> {
-    if (this.facts.closedSensor === true) {
-      await this.startOpeningFromClosed(`${reason}-closed-fallback`);
-      return;
-    }
-
-    await this.pulseMotor(reason);
-    this.startOpeningMotion('homekit', `${reason}-pulse-sent`);
-  }
-
-  private async startKnownCloseFromIdle(reason: string): Promise<void> {
-    if (this.facts.closedSensor === true) {
-      this.requestedTarget = null;
-      this.emitSnapshot(`${reason}-already-closed`);
-      return;
-    }
-
-    await this.pulseMotor(reason);
-    this.startClosingMotion('known', 'homekit', `${reason}-pulse-sent`);
-  }
-
-  private async startAmbiguousCloseAttempt(reason: string): Promise<void> {
-    if (this.facts.closedSensor === true) {
-      this.requestedTarget = null;
-      this.emitSnapshot(`${reason}-already-closed`);
-      return;
-    }
-
-    await this.pulseMotor(reason);
-    this.startClosingMotion('goalOnly', 'homekit', `${reason}-pulse-sent`);
-  }
-
-  private async reverseKnownMotion(finalDirection: MotionDirection, reason: string): Promise<void> {
-    if (this.plan.kind !== 'moving') {
-      return;
-    }
-
-    const stoppedFrom = this.plan.direction;
-    await this.pulseMotor(`${reason}-stop-current-motion`);
-
-    const deadlineAt = Date.now() + this.pulseGapMs + this.travelMs;
-    this.clearMovementTimer();
-    this.plan = {
-      kind: 'waitingSecondPulse',
-      stoppedFrom,
-      finalDirection,
-      source: 'homekit',
-      dueAt: Date.now() + this.pulseGapMs,
-      deadlineAt,
-      reason: finalDirection === 'opening' ? 'reverseToOpen' : 'reverseToClose',
+    const estimate = this.estimate;
+    const request = this.activeRequest;
+    const available = this.isAvailable();
+    const current = estimate.kind === 'closed' ? DoorCurrentState.CLOSED
+      : estimate.kind === 'open' ? DoorCurrentState.OPEN
+        : estimate.kind === 'moving' ? (estimate.direction === 'opening' ? DoorCurrentState.OPENING : DoorCurrentState.CLOSING)
+          : DoorCurrentState.STOPPED;
+    return {
+      available, transportConnected: this.transportConnected,
+      controlConnected: this.controlConnected, sensorConnected: this.sensorConnected,
+      closedSensor: this.closedSensor, sensorFreshSinceOnline: this.sensorFreshSinceOnline, observationEpoch: this.observationEpoch,
+      currentDoorState: available ? current : undefined,
+      targetDoorState: available ? (request ? (request.target === 'closed' ? DoorTargetState.CLOSED : DoorTargetState.OPEN)
+        : estimate.kind === 'closed' ? DoorTargetState.CLOSED : DoorTargetState.OPEN) : undefined,
+      requestedTarget: request?.target ?? null,
+      estimate: structuredClone(estimate), position: positionAt(estimate, this.clock.now(), this.timings),
+      nextPulseDirection: estimate.kind === 'closed' ? 'opening' : estimate.kind === 'open' ? 'closing'
+        : estimate.kind === 'stopped' ? estimate.nextDirection : estimate.kind === 'moving' ? 'stop' : 'unknown',
+      activeRequest: request ? {
+        id: request.id, target: request.target, attempts: request.attempts, pulseBudget: request.plan.length,
+        phase: request.phase, deadline: request.deadline,
+      } : null,
+      lastResult: this.lastResult ? { ...this.lastResult } : null, note: 'snapshot',
     };
-    this.schedulePhaseTimer(this.plan.dueAt);
-    this.emitSnapshot(`${reason}-waiting-second-pulse`);
   }
 
-  private startOpeningMotion(source: MotionSource, note: string): void {
-    this.clearPhaseTimer();
-    this.plan = {
-      kind: 'moving',
-      direction: 'opening',
-      certainty: 'known',
-      source,
-      startedAt: Date.now(),
-      deadlineAt: Date.now() + this.travelMs,
-    };
-    this.scheduleMovementTimer(this.plan.deadlineAt);
-    this.emitSnapshot(note);
-  }
-
-  private startClosingMotion(
-    certainty: MotionCertainty,
-    source: MotionSource,
-    note: string,
-  ): void {
-    this.clearPhaseTimer();
-    this.plan = {
-      kind: 'moving',
-      direction: 'closing',
-      certainty,
-      source,
-      startedAt: Date.now(),
-      deadlineAt: Date.now() + this.travelMs,
-    };
-    this.scheduleMovementTimer(this.plan.deadlineAt);
-    this.emitSnapshot(note);
-  }
-
-  private scheduleMovementTimer(deadlineAt: number): void {
-    this.clearMovementTimer();
-    const delayMs = Math.max(0, deadlineAt - Date.now());
-    const token = ++this.movementTimerToken;
-    this.movementTimer = setTimeout(() => {
-      void this.enqueue(`movement-timeout-${token}`, async () => {
-        if (token !== this.movementTimerToken) {
-          return;
+  private planRequest(target: GateTarget): readonly PulseStep[] {
+    const direction = targetDirection(target);
+    switch (this.estimate.kind) {
+      case 'closed': return target === 'closed' ? [] : ['start-opening'];
+      case 'open': return target === 'open' ? [] : ['start-closing'];
+      case 'unknown':
+        if (this.timings.unknownTargetPolicy === 'single_pulse_best_effort') {
+          return ['unknown'];
         }
-        await this.handleMovementTimeout();
-      });
-    }, delayMs);
-  }
-
-  private schedulePhaseTimer(dueAt: number): void {
-    this.clearPhaseTimer();
-    const delayMs = Math.max(0, dueAt - Date.now());
-    const token = ++this.phaseTimerToken;
-    this.phaseTimer = setTimeout(() => {
-      void this.enqueue(`phase-timer-${token}`, async () => {
-        if (token !== this.phaseTimerToken) {
-          return;
+        throw new Error('direction unknown; a fresh closed anchor or explicit single-pulse policy is required');
+      case 'stopped':
+        if (this.estimate.nextDirection === direction && this.estimate.position.min > 0 && this.estimate.position.max < 1) {
+          return [`start-${direction}`];
         }
-        await this.handlePhaseTimer();
-      });
-    }, delayMs);
-  }
-
-  private clearMovementTimer(): void {
-    if (this.movementTimer) {
-      clearTimeout(this.movementTimer);
-      this.movementTimer = undefined;
+        throw new Error('stopped next direction or endpoint is uncertain; wrong-way maneuvers are disabled');
+      case 'moving':
+        if (this.estimate.direction === direction) {
+          return [];
+        }
+        if (this.timings.allowSpeculativeSequences && canStopBeforeEndpoint(this.estimate, this.clock.now(), this.timings)) {
+          return [`stop-${this.estimate.direction}`, `start-${direction}`];
+        }
+        throw new Error('reversal requires speculative-sequence opt-in and an unambiguous remaining-travel interval');
     }
-    this.movementTimerToken += 1;
   }
 
-  private clearPhaseTimer(): void {
-    if (this.phaseTimer) {
-      clearTimeout(this.phaseTimer);
-      this.phaseTimer = undefined;
-    }
-    this.phaseTimerToken += 1;
-  }
-
-  private clearTimers(): void {
-    this.clearMovementTimer();
-    this.clearPhaseTimer();
-  }
-
-  private async handlePhaseTimer(): Promise<void> {
-    if (this.plan.kind !== 'waitingSecondPulse') {
+  private scheduleStep(request: ActiveRequest): void {
+    if (!this.isCurrent(request)) {
       return;
     }
-
-    const finalDirection = this.plan.finalDirection;
-
-    await this.pulseMotor(`second-pulse-${finalDirection}`);
-
-    this.clearPhaseTimer();
-    if (finalDirection === 'opening') {
-      this.startOpeningMotion(this.plan.source, `second-pulse-fired-${finalDirection}`);
-      return;
+    request.phase = 'waiting';
+    const delay = Math.max(0, this.lastPossibleActuationAt + this.pulseGapMs - this.clock.now());
+    if (delay === 0) {
+      this.executeStep(request);
+    } else {
+      this.stepTimer = this.clock.setTimeout(() => {
+        this.stepTimer = undefined;
+        this.executeStep(request);
+      }, delay);
     }
-
-    this.startClosingMotion('known', this.plan.source, `second-pulse-fired-${finalDirection}`);
   }
 
-  private async handleMovementTimeout(): Promise<void> {
-    if (this.plan.kind !== 'moving') {
+  private stepStillValid(step: PulseStep): boolean {
+    const estimate = this.estimate;
+    if (step === 'unknown') {
+      return estimate.kind === 'unknown';
+    }
+    if (step.startsWith('stop-')) {
+      return estimate.kind === 'moving' && step === `stop-${estimate.direction}`
+        && canStopBeforeEndpoint(estimate, this.clock.now(), this.timings);
+    }
+    if (estimate.kind === 'closed') {
+      return step === 'start-opening';
+    }
+    if (estimate.kind === 'open') {
+      return step === 'start-closing';
+    }
+    return estimate.kind === 'stopped' && step === `start-${estimate.nextDirection}`
+      && estimate.position.min > 0 && estimate.position.max < 1;
+  }
+
+  private executeStep(request: ActiveRequest): void {
+    this.expireMovement();
+    if (!this.isCurrent(request)) {
       return;
     }
-
-    if (this.facts.closedSensor === true) {
-      this.clearTimers();
-      this.plan = { kind: 'idle' };
-      this.idleNextPulseDirection = 'opening';
-      this.requestedTarget = null;
-      this.emitSnapshot('movement-timeout-but-already-closed');
+    const step = request.plan[request.nextStep];
+    if (!this.isAvailable() || this.clock.now() >= request.deadline || !step || request.attempts >= request.plan.length
+      || !this.stepStillValid(step)) {
+      this.finishRequest('cancelled', 'step-precondition-changed');
       return;
     }
-
-    if (this.plan.direction === 'opening') {
-      // Fully-open and partially-open look identical to us. Once the opening window
-      // expires without any contrary evidence, collapse to the stable open state.
-      this.clearTimers();
-      this.plan = { kind: 'idle' };
-      this.idleNotClosedMode = 'openKnown';
-      this.idleNextPulseDirection = 'closing';
-
-      if (this.requestedTarget === 'closed' && this.isAvailableForHomeKit()) {
-        this.emitSnapshot('opening-window-elapsed-but-close-still-requested');
-        void this.enqueue('auto-close-after-open', async () => {
-          await this.startKnownCloseFromIdle('auto-close-after-open');
-        });
+    if (this.clock.now() < this.lastPossibleActuationAt + this.pulseGapMs) {
+      this.scheduleStep(request);
+      return;
+    }
+    const before = this.estimate;
+    const contactRevision = this.contactRevision;
+    request.phase = 'publishing';
+    request.attempts += 1;
+    request.nextStep += 1;
+    const effect = {
+      requestId: request.id, stepId: request.nextStep, generation: request.generation,
+      correlationId: `${this.instanceId}:${request.generation}:${request.id}:${request.nextStep}`,
+    };
+    this.lastLocalEffect = { ...effect, attemptedAt: this.clock.now(), observed: false };
+    this.lastPossibleActuationAt = this.clock.now();
+    this.setEstimate(applyEstimatedPulse(before, this.clock.now(), this.timings, 'attempted-unconfirmed'));
+    this.io.log.info(`gate publication attempt ${JSON.stringify({ ...effect, step, pulseBudget: request.plan.length })}`);
+    this.publishTimer = this.clock.setTimeout(() => {
+      if (this.isCurrent(request) && request.phase === 'publishing') {
+        this.setEstimate(unknownEstimate());
+        this.finishRequest('unconfirmed', 'publication-timeout-delivery-ambiguous');
+      }
+    }, this.timings.publishTimeoutMs);
+    let publication: Promise<void>;
+    try {
+      publication = this.io.pulseMotor(step, effect);
+    } catch (error) {
+      publication = Promise.reject(error);
+    }
+    void publication.then(() => {
+      if (!this.isCurrent(request)) {
         return;
       }
-
-      this.requestedTarget = null;
-      this.emitSnapshot('opening-window-elapsed-open');
-      return;
-    }
-
-    this.io.log.warn(
-      this.plan.certainty === 'known'
-        ? 'closing window elapsed without reaching the closed sensor; leaving gate in generic open-ish state'
-        : 'ambiguous close attempt elapsed without reaching the closed sensor; leaving gate in generic open-ish state',
-    );
-    this.clearTimers();
-    this.plan = { kind: 'idle' };
-    this.idleNotClosedMode = 'openishUnknown';
-    this.idleNextPulseDirection = 'unknown';
-    this.requestedTarget = null;
-    this.emitSnapshot('closing-window-elapsed-openish');
-  }
-
-  private applyObservedExternalPulse(reason: string): void {
-    this.lastPulseLikeActivityAt = Date.now();
-    this.requestedTarget = null;
-
-    if (this.facts.closedSensor === true) {
-      this.startOpeningMotion('external', `external-pulse-observed-while-closed-${reason}`);
-      return;
-    }
-
-    if (this.plan.kind === 'moving') {
-      const currentDirection = this.plan.direction;
-      const currentCertainty = this.plan.certainty;
-      this.clearTimers();
-      this.plan = { kind: 'idle' };
-      this.idleNotClosedMode = 'openishUnknown';
-      this.idleNextPulseDirection = currentCertainty === 'known'
-        ? oppositeDirection(currentDirection)
-        : 'unknown';
-      this.emitSnapshot(`external-pulse-stopped-${currentDirection}-${reason}`);
-      return;
-    }
-
-    if (this.plan.kind === 'waitingSecondPulse') {
-      const finalDirection = this.plan.finalDirection;
-      this.clearTimers();
-      if (finalDirection === 'opening') {
-        this.startOpeningMotion('external', `external-pulse-fired-pending-opening-${reason}`);
+      this.clearTimer('publishTimer');
+      request.phase = 'observing';
+      if (this.estimate.evidence === 'attempted-unconfirmed') {
+        this.setEstimate({ ...this.estimate, evidence: 'published-unconfirmed' });
+      }
+      if (request.nextStep < request.plan.length) {
+        this.scheduleStep(request);
+      }
+      this.emitSnapshot('published-unconfirmed');
+    }, error => {
+      if (!this.isCurrent(request)) {
         return;
       }
-      this.startClosingMotion('known', 'external', `external-pulse-fired-pending-closing-${reason}`);
-      return;
-    }
-
-    if (this.idleNextPulseDirection === 'opening') {
-      this.startOpeningMotion('external', `external-pulse-started-opening-${reason}`);
-      return;
-    }
-
-    if (this.idleNextPulseDirection === 'closing') {
-      this.startClosingMotion('known', 'external', `external-pulse-started-closing-${reason}`);
-      return;
-    }
-
-    this.emitSnapshot(`external-pulse-observed-direction-unknown-${reason}`);
+      this.setEstimate(error instanceof GateNotSentError && contactRevision === this.contactRevision ? before : unknownEstimate());
+      this.finishRequest('unconfirmed', error instanceof GateNotSentError ? 'not-sent' : 'publication-error-delivery-ambiguous');
+    });
+    this.emitSnapshot('publication-started');
   }
 
-  private enterUnavailable(note: string): void {
-    this.clearTimers();
-    this.plan = { kind: 'idle' };
-    this.requestedTarget = null;
+  /** Terminal barrier: this function cannot plan, schedule, or send a pulse. */
+  private finishRequest(outcome: RequestOutcome, reason: string): void {
+    const request = this.activeRequest;
+    this.clearTimer('stepTimer');
+    this.clearTimer('publishTimer');
+    this.clearTimer('requestTimer');
+    if (!request) {
+      return;
+    }
+    this.activeRequest = undefined;
+    this.generation += 1;
+    this.lastResult = {
+      id: request.id, target: request.target, attempts: request.attempts, pulseBudget: request.plan.length,
+      outcome, reason, endedAt: this.clock.now(),
+    };
+    this.io.log.info(`gate request ${JSON.stringify(this.lastResult)}`);
+    this.emitSnapshot(reason);
+  }
+
+  private isCurrent(request: ActiveRequest): boolean {
+    return !this.disposed && this.activeRequest === request && this.generation === request.generation;
+  }
+
+  private isAvailable(): boolean {
+    return !this.disposed && this.transportConnected && this.controlConnected === true && this.sensorConnected === true
+      && this.sensorFreshSinceOnline && this.closedSensor !== null;
+  }
+
+  private loseObservations(reason: string): void {
+    this.finishRequest('cancelled', reason);
+    this.generation += 1;
+    this.observationEpoch += 1;
     this.sensorFreshSinceOnline = false;
-    this.idleNotClosedMode = 'openishUnknown';
-    this.idleNextPulseDirection = 'unknown';
-    this.emitSnapshot(note);
+    this.closedSensor = null;
+    this.lastContactAt = -Infinity;
+    this.setEstimate(unknownEstimate());
+    this.emitSnapshot(reason);
   }
 
-  private isAvailableForHomeKit(): boolean {
-    return this.facts.controlConnected === true
-      && this.facts.sensorConnected === true
-      && this.sensorFreshSinceOnline
-      && this.facts.closedSensor !== null;
-  }
-
-  private async pulseMotor(reason: string): Promise<void> {
-    const elapsed = Date.now() - this.lastPulseLikeActivityAt;
-    if (elapsed < this.pulseGapMs) {
-      await delay(this.pulseGapMs - elapsed);
+  private setEstimate(estimate: GateEstimate): void {
+    this.clearTimer('movementTimer');
+    this.estimate = estimate;
+    if (estimate.kind === 'moving' && !this.disposed) {
+      this.movementTimer = this.clock.setTimeout(() => {
+        if (this.estimate === estimate) {
+          if (this.clock.now() < this.movementDeadline(estimate)) {
+            // Runtime timers may truncate fractional milliseconds or wake early.
+            this.setEstimate(estimate);
+          } else {
+            this.expireMovement();
+          }
+        }
+      }, Math.max(1, this.movementDeadline(estimate) - this.clock.now()));
     }
+  }
 
-    this.io.log.info(`motor pulse -> ${reason}`);
-    await this.io.pulseMotor(reason);
-    this.lastPulseLikeActivityAt = Date.now();
+  private expireMovement(): void {
+    const estimate = this.estimate;
+    if (estimate.kind !== 'moving' || this.clock.now() < this.movementDeadline(estimate)) {
+      return;
+    }
+    const estimatedOpen = estimate.direction === 'opening' && this.timings.assumeOpenAfterTravel
+      && this.closedSensor === false && this.activeRequest?.phase !== 'publishing';
+    this.setEstimate(estimatedOpen ? { kind: 'open', evidence: estimate.evidence } : unknownEstimate());
+    if (estimatedOpen && this.activeRequest?.target === 'closed') {
+      this.finishRequest('failed', 'target-mismatch-open');
+    } else {
+      this.finishRequest(estimatedOpen ? 'estimated' : 'unconfirmed', estimatedOpen ? 'estimated-open' : 'travel-ended-unconfirmed');
+    }
+    this.emitSnapshot('travel-ended');
+  }
+
+  private movementDeadline(estimate: Extract<GateEstimate, { kind: 'moving' }>): number {
+    return estimate.latestEnd + (estimate.direction === 'closing' ? this.timings.sensorDelayMs + this.timings.sensorDebounceMs : 0);
+  }
+
+  private clearTimer(name: 'movementTimer' | 'stepTimer' | 'publishTimer' | 'requestTimer'): void {
+    const timer = this[name];
+    if (timer !== undefined) {
+      this.clock.clearTimeout(timer);
+      this[name] = undefined;
+    }
   }
 
   private emitSnapshot(note: string): void {
-    if (this.disposed) {
-      return;
+    if (!this.disposed) {
+      this.io.publishSnapshot({ ...this.getSnapshot(), note });
     }
-    this.io.publishSnapshot(this.buildSnapshot(note));
-  }
-
-  private buildSnapshot(note: string): FrontGateSnapshot {
-    const available = this.isAvailableForHomeKit();
-
-    return {
-      available,
-      controlConnected: this.facts.controlConnected,
-      sensorConnected: this.facts.sensorConnected,
-      closedSensor: this.facts.closedSensor,
-      sensorFreshSinceOnline: this.sensorFreshSinceOnline,
-      currentDoorState: available ? this.computeCurrentDoorState() : undefined,
-      targetDoorState: available ? this.computeTargetDoorState() : undefined,
-      requestedTarget: this.requestedTarget,
-      motionDirection: this.getMotionDirection(),
-      motionCertainty: this.getMotionCertainty(),
-      planKind: this.plan.kind,
-      idleNotClosedMode: this.idleNotClosedMode,
-      nextPulseDirection: this.idleNextPulseDirection,
-      note,
-    };
-  }
-
-  private getMotionDirection(): MotionDirection | 'none' {
-    if (this.plan.kind === 'moving') {
-      return this.plan.direction;
-    }
-    if (this.plan.kind === 'waitingSecondPulse') {
-      return this.plan.finalDirection;
-    }
-    return 'none';
-  }
-
-  private getMotionCertainty(): MotionCertainty | 'none' {
-    if (this.plan.kind === 'moving') {
-      return this.plan.certainty;
-    }
-    if (this.plan.kind === 'waitingSecondPulse') {
-      return 'known';
-    }
-    return 'none';
-  }
-
-  private computeCurrentDoorState(): DoorCurrentState {
-    if (this.plan.kind === 'moving') {
-      return this.plan.direction === 'closing' ? DoorCurrentState.CLOSING : DoorCurrentState.OPENING;
-    }
-
-    if (this.plan.kind === 'waitingSecondPulse') {
-      return this.plan.finalDirection === 'closing' ? DoorCurrentState.CLOSING : DoorCurrentState.OPENING;
-    }
-
-    return this.facts.closedSensor ? DoorCurrentState.CLOSED : DoorCurrentState.OPEN;
-  }
-
-  private computeTargetDoorState(): DoorTargetState {
-    if (this.requestedTarget) {
-      return this.requestedTarget === 'closed' ? DoorTargetState.CLOSED : DoorTargetState.OPEN;
-    }
-
-    if (this.plan.kind === 'moving') {
-      return this.plan.direction === 'closing' ? DoorTargetState.CLOSED : DoorTargetState.OPEN;
-    }
-
-    if (this.plan.kind === 'waitingSecondPulse') {
-      return this.plan.finalDirection === 'closing' ? DoorTargetState.CLOSED : DoorTargetState.OPEN;
-    }
-
-    return this.facts.closedSensor ? DoorTargetState.CLOSED : DoorTargetState.OPEN;
   }
 }

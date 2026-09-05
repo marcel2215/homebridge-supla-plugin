@@ -10,12 +10,18 @@ export class SuplaMqttClient {
   public client: MqttClient;
   constructor(
     private readonly context : SuplaMqttClientContext,
-    private readonly log : Logger) {
+    private readonly log : Logger,
+    mode: { gateActuation?: boolean; protocolVersion?: 4 | 5 } = {},
+  ) {
     const options: mqtt.IClientOptions = {
       username: context.username,
       password: context.password,
       resubscribe: false,
     };
+    if (mode.gateActuation) {
+      // Isolated from ordinary accessory delivery settings. Never replay a gate pulse.
+      Object.assign(options, { clean: true, queueQoSZero: false, protocolVersion: mode.protocolVersion ?? 4 });
+    }
     const protocol = this.resolveProtocol();
     if (this.usesTls(protocol)) {
       Object.assign(options, this.resolveTlsOptions());

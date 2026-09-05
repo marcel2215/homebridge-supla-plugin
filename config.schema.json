@@ -14,9 +14,9 @@
       "default": "mqtt24.supla.org"
     },
     "port": {
-        "title": "Port",
-        "type": "number",
-        "default": 8883
+      "title": "Port",
+      "type": "number",
+      "default": 8883
     },
     "protocol": {
       "title": "Protocol",
@@ -131,22 +131,14 @@
     "frontGateReversePauseMs": {
       "title": "Front Gate Reverse Pause (ms)",
       "type": "number",
-      "default": 900
-    },
-    "frontGateWrongDirectionRunMs": {
-      "title": "Front Gate Wrong Direction Run (ms)",
-      "type": "number",
-      "default": 700
+      "default": 3000,
+      "minimum": 3000
     },
     "frontGateMinimumPulseGapMs": {
       "title": "Front Gate Minimum Pulse Gap (ms)",
       "type": "number",
-      "default": 400
-    },
-    "frontGateCloseRetryLimit": {
-      "title": "Front Gate Close Retry Limit",
-      "type": "number",
-      "default": 1
+      "default": 3000,
+      "minimum": 3000
     },
     "gateLockControlMode": {
       "title": "Gate Lock Control Mode",
@@ -251,6 +243,175 @@
       "title": "Cached Channels",
       "type": "string",
       "default": "[]"
+    },
+    "frontGateMqttProtocolVersion": {
+      "title": "Front Gate MQTT Protocol",
+      "type": "number",
+      "enum": [
+        4,
+        5
+      ],
+      "default": 4,
+      "description": "4 = MQTT 3.1.1; matching command echoes are ambiguous and cancel plans. Use 5 only if your broker supports MQTT 5 noLocal."
+    },
+    "frontGates": {
+      "title": "Front Gates",
+      "type": "array",
+      "default": [],
+      "items": {
+        "type": "object",
+        "required": [
+          "deviceId",
+          "channelId"
+        ],
+        "properties": {
+          "deviceId": {
+            "title": "Control Device ID",
+            "type": "integer",
+            "minimum": 1
+          },
+          "channelId": {
+            "title": "Control Channel ID",
+            "type": "integer",
+            "minimum": 1
+          },
+          "sensorDeviceId": {
+            "title": "Closed Contact Device ID",
+            "type": "integer",
+            "minimum": 1
+          },
+          "sensorChannelId": {
+            "title": "Closed Contact Channel ID",
+            "type": "integer",
+            "minimum": 1
+          },
+          "sensorTopic": {
+            "title": "Alternative Exact Contact Topic Base",
+            "type": "string",
+            "description": "Use instead of both contact IDs. Must have /state/hi and /state/connected. Do not use the motor channel projection."
+          },
+          "sensorInverted": {
+            "title": "Invert Contact",
+            "type": "boolean",
+            "default": false,
+            "description": "Normalize the actual source polarity. Cloud gate /state/hi true means closed; raw/local contact conventions may differ."
+          },
+          "openingTravelMs": {
+            "title": "Opening Travel (ms)",
+            "type": "number",
+            "minimum": 5000,
+            "maximum": 120000,
+            "default": 25000
+          },
+          "closingTravelMs": {
+            "title": "Closing Travel (ms)",
+            "type": "number",
+            "minimum": 5000,
+            "maximum": 120000,
+            "default": 25000
+          },
+          "travelUncertainty": {
+            "title": "Travel Uncertainty Fraction",
+            "type": "number",
+            "minimum": 0,
+            "maximum": 0.5,
+            "default": 0.1,
+            "description": "0.1 estimates travel between 90% and 110% of nominal duration. Timing estimates do not detect hidden remote actions."
+          },
+          "actuationDelayMs": {
+            "title": "Maximum Delivery and Motor Start Delay (ms)",
+            "type": "number",
+            "minimum": 0,
+            "maximum": 15000,
+            "default": 2500
+          },
+          "minimumPulseGapMs": {
+            "title": "Minimum Pulse Gap (ms)",
+            "type": "number",
+            "minimum": 3000,
+            "maximum": 30000,
+            "default": 3000
+          },
+          "reversePauseMs": {
+            "title": "Reversal Pause (ms)",
+            "type": "number",
+            "minimum": 3000,
+            "maximum": 30000,
+            "default": 3000
+          },
+          "relayHighMs": {
+            "title": "Relay High Duration (ms)",
+            "type": "number",
+            "minimum": 0,
+            "maximum": 15000,
+            "default": 500
+          },
+          "relayReleaseMarginMs": {
+            "title": "Relay Release Margin (ms)",
+            "type": "number",
+            "minimum": 0,
+            "maximum": 15000,
+            "default": 500
+          },
+          "publishTimeoutMs": {
+            "title": "Publication Timeout (ms)",
+            "type": "number",
+            "minimum": 100,
+            "maximum": 5000,
+            "default": 2500
+          },
+          "departureGraceMs": {
+            "title": "Closed Contact Departure Grace (ms)",
+            "type": "number",
+            "minimum": 0,
+            "maximum": 30000,
+            "default": 4000
+          },
+          "sensorDebounceMs": {
+            "title": "Contact Debounce (ms)",
+            "type": "number",
+            "minimum": 0,
+            "maximum": 2000,
+            "default": 200
+          },
+          "unknownTargetPolicy": {
+            "title": "Unknown Direction Policy",
+            "type": "string",
+            "enum": [
+              "reject",
+              "single_pulse_best_effort"
+            ],
+            "default": "reject",
+            "description": "Single pulse is an explicit best-effort attempt, with no direction claim or retry."
+          },
+          "assumeOpenAfterTravel": {
+            "title": "Allow Estimated Fully Open",
+            "type": "boolean",
+            "default": false,
+            "description": "Opt in to OPEN after the latest estimated arrival. Hidden stops can invalidate this estimate."
+          },
+          "allowSpeculativeSequences": {
+            "title": "Allow Planned Two-pulse Reversals",
+            "type": "boolean",
+            "default": false,
+            "description": "Uses unconfirmed local motion estimates. Cancels on ambiguity, interference, unavailable telemetry or changed preconditions."
+          },
+          "observationTopic": {
+            "title": "Optional Native Sidecar Event Topic",
+            "type": "string",
+            "description": "Separate read-only telemetry; requires a sidecar implementing the documented contract. Native events do not cover every command source."
+          },
+          "sensorDelayMs": {
+            "title": "Maximum Contact Reporting Delay (ms)",
+            "type": "number",
+            "minimum": 0,
+            "maximum": 15000,
+            "default": 1000,
+            "description": "Widen externally observed departure position and allow delayed closure confirmation."
+          }
+        }
+      },
+      "description": "Map each control channel explicitly to its closed contact. No automatic caption-based sensor selection."
     }
   }
 }

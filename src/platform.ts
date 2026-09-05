@@ -25,7 +25,8 @@ import {ThermostatAccessory} from './Accesories/ThermostatAccessory';
 import {ElectricityMeterAccessory} from './Accesories/ElectricityMeterAccessory';
 import {DimmerRgbLightAccessory} from './Accesories/DimmerRgbLightAccessory';
 import {ActionTriggerAccessory} from './Accesories/ActionTriggerAccessory';
-import type {FrontGateTimingConfig} from './Accesories/FrontGateFsm';
+import { resolveFrontGateConfig, ResolvedFrontGateConfig } from './Accesories/FrontGateConfig';
+import { GateMqttTransport } from './Heplers/GateMqttTransport';
 
 
 /**
@@ -63,11 +64,6 @@ export class SuplaPlatform implements DynamicPlatformPlugin {
   private readonly gatePublishRetryDelayMs: number;
   private readonly gateStrictReverseDoublePulse: boolean;
   private readonly gateDebugTimeline: boolean;
-  private readonly frontGateFullTravelMs: number;
-  private readonly frontGateReversePauseMs: number;
-  private readonly frontGateWrongDirectionRunMs: number;
-  private readonly frontGateMinimumPulseGapMs: number;
-  private readonly frontGateCloseRetryLimit: number;
   private readonly commandQos: 0 | 1 | 2;
   private readonly commandRetain: boolean;
   private readonly mqttHandlers = new Map<string, Set<(message: Buffer, topic: string) => void>>();
@@ -87,6 +83,8 @@ export class SuplaPlatform implements DynamicPlatformPlugin {
   }>();
 
   private mqttRouterAttached = false;
+  private gateTransport?: GateMqttTransport;
+  private knownChannels: SuplaChannelContext[] = [];
 
   constructor(
     public readonly log: Logger,
@@ -119,11 +117,6 @@ export class SuplaPlatform implements DynamicPlatformPlugin {
       gatePublishRetryDelayMs?: number;
       gateStrictReverseDoublePulse?: boolean | string;
       gateDebugTimeline?: boolean | string;
-      frontGateFullTravelMs?: number;
-      frontGateReversePauseMs?: number;
-      frontGateWrongDirectionRunMs?: number;
-      frontGateMinimumPulseGapMs?: number;
-      frontGateCloseRetryLimit?: number;
       commandQos?: number;
       commandRetain?: boolean | string;
     };
@@ -161,26 +154,12 @@ export class SuplaPlatform implements DynamicPlatformPlugin {
       configView.gateStrictReverseDoublePulse ?? true,
     );
     this.gateDebugTimeline = this.parseBoolean(configView.gateDebugTimeline ?? false);
-    this.frontGateFullTravelMs = this.normalizeFrontGateFullTravelMs(
-      configView.frontGateFullTravelMs ?? configView.gateOpenAssumeDelayMs,
-    );
-    this.frontGateReversePauseMs = this.normalizeFrontGateReversePauseMs(
-      configView.frontGateReversePauseMs,
-    );
-    this.frontGateWrongDirectionRunMs = this.normalizeFrontGateWrongDirectionRunMs(
-      configView.frontGateWrongDirectionRunMs,
-    );
-    this.frontGateMinimumPulseGapMs = this.normalizeFrontGateMinimumPulseGapMs(
-      configView.frontGateMinimumPulseGapMs ?? configView.gateCommandCooldownMs,
-    );
-    this.frontGateCloseRetryLimit = this.normalizeFrontGateCloseRetryLimit(
-      configView.frontGateCloseRetryLimit,
-    );
     this.commandQos = this.normalizeCommandQos(configView.commandQos);
     this.commandRetain = this.parseBoolean(configView.commandRetain ?? false);
 
     this.api.on('shutdown', () => {
       this.unregisterAllMqttHandlers();
+      this.gateTransport?.dispose();
       if (this.MqttClient) {
         this.MqttClient.client.end(true);
       }
@@ -252,6 +231,7 @@ export class SuplaPlatform implements DynamicPlatformPlugin {
   discoverDevices(channelsOverride?: Array<SuplaChannelContext>) {
     const rawChannels = channelsOverride ?? this.loadChannelsFromConfig();
     const channels = rawChannels.map(channel => this.normalizeChannelContext(channel));
+    this.knownChannels = channels;
     this.log.info('Channels discovered:', channels.length);
     this.log.debug(
       `Discovery mode: ${channelsOverride ? 'live' : 'cached'} channels`,
@@ -292,7 +272,8 @@ export class SuplaPlatform implements DynamicPlatformPlugin {
           `Restoring channel ${channel.channelCaption} (${channel.deviceId}/${channel.channelId}) ` +
           `function=${channel.channelFunction} type=${channel.channelType}`,
         );
-        if (previousSignature !== signature || !wasConfigured) {
+        // Gate contact authorization depends on the complete discovered channel set, not only this channel's signature.
+        if (previousSignature !== signature || !wasConfigured || channel.channelFunction === 'CONTROLLINGTHEGATE') {
           if (previousSignature && previousSignature !== signature) {
             this.resetAccessoryServices(existingAccessory);
           }
@@ -659,31 +640,20 @@ export class SuplaPlatform implements DynamicPlatformPlugin {
     return this.gateDebugTimeline;
   }
 
-  public getFrontGateTimings(): FrontGateTimingConfig {
-    return {
-      fullTravelMs: this.frontGateFullTravelMs,
-      reversePauseMs: this.frontGateReversePauseMs,
-      wrongDirectionRunMs: this.frontGateWrongDirectionRunMs,
-      minimumPulseGapMs: this.frontGateMinimumPulseGapMs,
-      closeRetryLimit: this.frontGateCloseRetryLimit,
-    };
+  public getFrontGateConfig(context: SuplaChannelContext): ResolvedFrontGateConfig {
+    const channels = this.knownChannels.length ? this.knownChannels : this.loadChannelsFromConfig();
+    return resolveFrontGateConfig(this.config, context, channels, message => this.log.warn(`[FrontGate ${context.channelId}] ${message}`));
   }
 
-  public getFrontGatePulseAction(): string {
-    const toggleAction = this.gateExecuteActionToggle.trim();
-    if (toggleAction) {
-      return toggleAction;
+  public getGateMqttTransport(): GateMqttTransport {
+    if (!this.gateTransport) {
+      const protocolVersion = Number(this.config.frontGateMqttProtocolVersion) === 5 ? 5 : 4;
+      const mqtt = new SuplaMqttClient(
+        this.config as unknown as SuplaMqttClientContext, this.log, { gateActuation: true, protocolVersion },
+      );
+      this.gateTransport = new GateMqttTransport(mqtt.client, this.log);
     }
-
-    const openAction = this.gateExecuteActionOpen.trim();
-    const closeAction = this.gateExecuteActionClose.trim();
-    if (openAction && openAction === closeAction) {
-      return openAction;
-    }
-    if (openAction) {
-      return openAction;
-    }
-    return closeAction;
+    return this.gateTransport;
   }
 
   private normalizeCoveringControlMode(value?: string): 'set' | 'execute_action' | 'hybrid' {
@@ -767,56 +737,6 @@ export class SuplaPlatform implements DynamicPlatformPlugin {
     }
     const rounded = Math.round(parsed);
     return Math.min(5000, Math.max(0, rounded));
-  }
-
-  private normalizeFrontGateFullTravelMs(value?: number): number {
-    const fallbackMs = 25000;
-    const parsed = Number(value);
-    if (!Number.isFinite(parsed)) {
-      return fallbackMs;
-    }
-    const rounded = Math.round(parsed);
-    return Math.min(120000, Math.max(5000, rounded));
-  }
-
-  private normalizeFrontGateReversePauseMs(value?: number): number {
-    const fallbackMs = 3000;
-    const parsed = Number(value);
-    if (!Number.isFinite(parsed)) {
-      return fallbackMs;
-    }
-    const rounded = Math.round(parsed);
-    return Math.min(15000, Math.max(3000, rounded));
-  }
-
-  private normalizeFrontGateWrongDirectionRunMs(value?: number): number {
-    const fallbackMs = 700;
-    const parsed = Number(value);
-    if (!Number.isFinite(parsed)) {
-      return fallbackMs;
-    }
-    const rounded = Math.round(parsed);
-    return Math.min(5000, Math.max(100, rounded));
-  }
-
-  private normalizeFrontGateMinimumPulseGapMs(value?: number): number {
-    const fallbackMs = 3000;
-    const parsed = Number(value);
-    if (!Number.isFinite(parsed)) {
-      return fallbackMs;
-    }
-    const rounded = Math.round(parsed);
-    return Math.min(10000, Math.max(0, rounded));
-  }
-
-  private normalizeFrontGateCloseRetryLimit(value?: number): number {
-    const fallbackValue = 0;
-    const parsed = Number(value);
-    if (!Number.isFinite(parsed)) {
-      return fallbackValue;
-    }
-    const rounded = Math.round(parsed);
-    return Math.min(3, Math.max(0, rounded));
   }
 
   private normalizeTopicSuffix(value: string): string {

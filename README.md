@@ -30,3 +30,11 @@ $ npm i homebridge-supla-plugin
 2. Configure the plugin. You can find your MQTT credentials in the [Supla Cloud](https://cloud.supla.org/).
 3. Restart Homebridge
 4. Plugin will automatically discover your devices and add them to HomeKit
+
+### Front gate configuration and behavior
+
+Front gates (`CONTROLLINGTHEGATE`) use finite, cancellable `open_close` requests. An unexpected closure during OPEN updates HomeKit to CLOSED and sends no recovery pulse. Unknown state is rejected by default; estimated full opening and two-pulse reversals require explicit opt-ins.
+
+Configure an exact control-to-contact mapping for each gate using [this example](examples/front-gate.json). Previous caption-based sensor selection and seek/retry behavior are disabled. MQTT 3.1.1 cannot reliably identify own command echoes, so ambiguous echoes cancel pending requests; MQTT 5 `noLocal` can improve this when supported by your broker.
+
+Read the [front gate configuration, migration and observation guide](docs/FRONT_GATE.md) before updating an existing gate installation. Run `npm test` for production controller and adapter tests, or `npm run test:report` to regenerate the [machine-readable validation report](docs/gate-validation.json).
