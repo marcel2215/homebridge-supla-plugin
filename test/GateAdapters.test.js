@@ -11,6 +11,8 @@ const { GateMqttTransport } = require('../dist/Heplers/GateMqttTransport');
 const { GateAccessory, parseGateBoolean } = require('../dist/Accesories/GateAccessory');
 const { NativeGateObserver } = require('../dist/Accesories/GateObservationSource');
 const { resolveFrontGateConfig, normalizeFrontGateTimings } = require('../dist/Accesories/FrontGateConfig');
+const { gateClock } = require('../dist/Accesories/FrontGateFsm');
+const { FakeClock } = require('./helpers/VirtualGate');
 
 const log = { debug() {}, info() {}, warn() {}, error() {} };
 const base = 'supla/test/devices/10/channels/20';
@@ -90,6 +92,136 @@ function accessoryHarness(t, { version = 5, options = {}, validMapping = true, d
   };
 }
 const immediate = () => new Promise(resolve => setImmediate(resolve));
+
+function fakeAccessoryClock(t) {
+  const clock = new FakeClock();
+  t.mock.method(gateClock, 'now', clock.now);
+  t.mock.method(global, 'setTimeout', (callback, ms, ...args) => ({
+    id: clock.setTimeout(() => callback(...args), ms), unref() { return this; },
+  }));
+  t.mock.method(global, 'clearTimeout', timer => clock.clearTimeout(timer?.id ?? timer));
+  return clock;
+}
+
+test('R3: ignored retained contact cannot bypass debounce and authorize OPEN on a brief spike', async t => {
+  const clock = fakeAccessoryClock(t);
+  const h = accessoryHarness(t, { options: { sensorDebounceMs: 200 } });
+  h.online();
+  h.contact(false);
+  await clock.tick(200);
+  assert.equal(h.adapter.fsm.getSnapshot().closedSensor, false);
+  h.contact(true, { retain: true });
+  await clock.tick(200);
+  assert.equal(h.adapter.fsm.getSnapshot().closedSensor, false);
+  h.contact(true);
+  const duringSpike = h.adapter.fsm.getSnapshot();
+  const accepted = await h.target.handleSetRequest(0).then(() => true, () => false);
+  await clock.tick(20);
+  h.contact(false);
+  await clock.tick(200);
+  assert.equal(h.client.publications.length, 0);
+  assert.equal(accepted, false);
+  assert.notEqual(duringSpike.estimate.kind, 'closed');
+  assert.notEqual(h.adapter.fsm.getSnapshot().estimate.kind, 'closed');
+});
+
+for (const retainedValue of [false, true, 'garbage']) {
+  test(`R3: ignored retained ${retainedValue} leaves an existing live debounce intact`, async t => {
+    const clock = fakeAccessoryClock(t);
+    const h = accessoryHarness(t, { options: { sensorDebounceMs: 200 } });
+    h.online();
+    h.contact(false);
+    await clock.tick(200);
+    h.contact(true);
+    await clock.tick(100);
+    h.contact(retainedValue, { retain: true });
+    await clock.tick(99);
+    await assert.rejects(h.target.handleSetRequest(0));
+    assert.equal(h.client.publications.length, 0);
+    await clock.tick(1);
+    assert.equal(h.adapter.fsm.getSnapshot().estimate.kind, 'closed');
+    await h.target.handleSetRequest(0);
+    assert.equal(h.client.publications.length, 1);
+  });
+}
+
+for (const offline of ['sensor', 'transport']) {
+  test(`R3: contact packets during ${offline} loss cannot pre-seed the next live debounce`, async t => {
+    const clock = fakeAccessoryClock(t);
+    const h = accessoryHarness(t, { options: { sensorDebounceMs: 200 } });
+    h.online();
+    h.contact(false);
+    await clock.tick(200);
+    if (offline === 'sensor') h.client.message(`${sensorBase}/state/connected`, false);
+    else h.client.disconnect();
+    h.contact(true);
+    await clock.tick(200);
+    assert.equal(h.adapter.fsm.getSnapshot().closedSensor, null);
+    if (offline === 'transport') h.client.reconnect();
+    h.client.message(`${base}/state/connected`, true);
+    h.client.message(`${sensorBase}/state/connected`, true);
+    h.contact(true);
+    await assert.rejects(h.target.handleSetRequest(0));
+    assert.equal(h.client.publications.length, 0);
+    await clock.tick(200);
+    assert.equal(h.adapter.fsm.getSnapshot().estimate.kind, 'closed');
+  });
+}
+
+test('R3: a debounce callback from an obsolete observation epoch cannot commit or poison the baseline', async t => {
+  const clock = fakeAccessoryClock(t);
+  const h = accessoryHarness(t, { options: { sensorDebounceMs: 200 } });
+  h.online();
+  h.contact(false);
+  await clock.tick(200);
+  h.contact(true);
+  h.adapter.fsm.handleInvalidContact(); // Invalidate the epoch while the adapter still has a delayed sample.
+  await clock.tick(200);
+  assert.equal(h.adapter.fsm.getSnapshot().closedSensor, null);
+  h.contact(true);
+  await assert.rejects(h.target.handleSetRequest(0));
+  await clock.tick(200);
+  assert.equal(h.adapter.fsm.getSnapshot().estimate.kind, 'closed');
+  assert.equal(h.client.publications.length, 0);
+});
+
+test('R3: sustained live closure ends an already attempted OPEN without any later reopening', async t => {
+  const clock = fakeAccessoryClock(t);
+  const h = accessoryHarness(t, { options: { sensorDebounceMs: 200 } });
+  h.online();
+  await clock.tick(200);
+  await h.target.handleSetRequest(0);
+  h.contact(false);
+  await clock.tick(200);
+  h.contact(true);
+  await clock.tick(200);
+  assert.equal(h.adapter.fsm.getSnapshot().lastResult.reason, 'target-mismatch-closed');
+  await immediate();
+  assert.equal(h.current.value, hap.Characteristic.CurrentDoorState.CLOSED);
+  assert.equal(h.target.value, hap.Characteristic.TargetDoorState.CLOSED);
+  await clock.tick(250000);
+  assert.equal(h.client.publications.length, 1);
+});
+
+test('R2: the real HAP rejection/reporting sequence keeps a closing estimate targeting CLOSED', async t => {
+  const clock = fakeAccessoryClock(t);
+  const h = accessoryHarness(t, { options: { assumeOpenAfterTravel: true } });
+  h.online();
+  await h.target.handleSetRequest(0);
+  h.contact(false);
+  await clock.tick(31000);
+  assert.equal(h.current.value, hap.Characteristic.CurrentDoorState.OPEN);
+  await h.target.handleSetRequest(1);
+  await clock.tick(1000);
+  await assert.rejects(h.target.handleSetRequest(0));
+  await immediate();
+  assert.equal(h.current.value, hap.Characteristic.CurrentDoorState.CLOSING);
+  assert.equal(h.target.value, hap.Characteristic.TargetDoorState.CLOSED);
+  assert.equal(await h.target.handleGetRequest(), hap.Characteristic.TargetDoorState.CLOSED);
+  assert.equal(h.adapter.fsm.getSnapshot().activeRequest, null);
+  await clock.tick(250000);
+  assert.equal(h.client.publications.length, 2);
+});
 
 for (const version of [4, 5]) {
   test(`MQTT ${version} gate publications remain open_close, QoS 0, non-retained`, async t => {

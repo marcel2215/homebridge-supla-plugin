@@ -68,7 +68,8 @@ export class RollerShutterAccessory {
       : `${this.baseTopic}/state/connected`;
 
     this.platform.log.debug(
-      `RollerShutter ${this.accessory.displayName} topics: status=${statusTopic}, connected=${connectedTopic ?? 'n/a'}, legacy=${this.legacyMode}`,
+      `RollerShutter ${this.accessory.displayName} topics: status=${statusTopic}, `
+      + `connected=${connectedTopic ?? 'n/a'}, legacy=${this.legacyMode}`,
     );
 
     this.platform.registerMqttHandler(

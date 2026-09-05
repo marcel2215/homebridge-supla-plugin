@@ -2,6 +2,8 @@
 src
 mqtt-example-dumps/
 .codex/
+test/
+test-results/
 
 # ------------- Defaults ------------- #
 

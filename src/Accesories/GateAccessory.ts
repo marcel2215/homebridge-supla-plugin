@@ -111,13 +111,8 @@ export class GateAccessory {
           }
         } else if (topic === `${sensorBase}/state/hi`) {
           const value = parseGateBoolean(message.toString());
-          if (value === undefined) {
-            this.clearDebounce();
-            this.lastContact = undefined;
-            this.fsm.handleInvalidContact();
-          } else {
-            this.observeContact(config.sensorInverted ? !value : value, packet, config.timings.sensorDebounceMs);
-          }
+          this.observeContact(value === undefined ? undefined : config.sensorInverted ? !value : value,
+            packet, config.timings.sensorDebounceMs);
         } else {
           const connected = parseGateBoolean(message.toString()) === true;
           if (!connected) {
@@ -183,11 +178,17 @@ export class GateAccessory {
     }
   }
 
-  private observeContact(closed: boolean, packet: IPublishPacket, debounceMs: number): void {
+  private observeContact(closed: boolean | undefined, packet: IPublishPacket, debounceMs: number): void {
     const metadata: ContactMetadata = {
       retained: Boolean(packet.retain), receivedAt: gateClock.now(), epoch: this.fsm.getSnapshot().observationEpoch,
     };
-    if (metadata.retained && this.fsm.getSnapshot().activeRequest) {
+    if (!this.fsm.acceptsContact(metadata)) {
+      return;
+    }
+    if (closed === undefined) {
+      this.clearDebounce();
+      this.lastContact = undefined;
+      this.fsm.handleInvalidContact();
       return;
     }
     if (this.pendingContact === closed) {
@@ -195,8 +196,9 @@ export class GateAccessory {
     }
     this.clearDebounce();
     if (closed === this.lastContact || debounceMs === 0) {
-      this.lastContact = closed;
-      this.fsm.handleClosedSensorChange(closed, metadata);
+      if (this.fsm.handleClosedSensorChange(closed, metadata)) {
+        this.lastContact = closed;
+      }
       return;
     }
     if (this.lastContact !== undefined && !metadata.retained) {
@@ -206,9 +208,8 @@ export class GateAccessory {
     this.debounceTimer = setTimeout(() => {
       this.debounceTimer = undefined;
       this.pendingContact = undefined;
-      this.lastContact = closed;
-      if (!this.disposed) {
-        this.fsm.handleClosedSensorChange(closed, metadata);
+      if (!this.disposed && this.fsm.handleClosedSensorChange(closed, metadata)) {
+        this.lastContact = closed;
       }
     }, debounceMs);
   }

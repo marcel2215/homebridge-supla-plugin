@@ -106,6 +106,7 @@ export class FrontGateFsm {
   private estimate: GateEstimate = unknownEstimate();
   private lastPossibleActuationAt = -Infinity;
   private lastContactAt = -Infinity;
+  private lastClosedAnchor?: { earliestAt: number; latestAt: number };
   private contactRevision = 0;
   private lastLocalEffect?: GatePulseEffect & { attemptedAt: number; observed: boolean };
   private movementTimer?: ReturnType<typeof setTimeout>;
@@ -122,7 +123,7 @@ export class FrontGateFsm {
     this.timings = normalizeFrontGateTimings(timings, message => io.log.warn(message));
     this.pulseGapMs = Math.max(
       this.timings.minimumPulseGapMs, this.timings.reversePauseMs,
-      this.timings.relayHighMs + this.timings.relayReleaseMarginMs + this.timings.actuationDelayMs,
+      this.timings.relayHighMs + this.timings.relayReleaseMarginMs,
     );
     this.emitSnapshot('initialized');
   }
@@ -188,42 +189,63 @@ export class FrontGateFsm {
     }
   }
 
-  public handleClosedSensorChange(closed: boolean, metadata: ContactMetadata = {}): void {
+  /** Shared, side-effect-free admission policy for receipt and delayed debounce commitment. */
+  public acceptsContact(metadata: ContactMetadata = {}): boolean {
     const now = this.clock.now();
     const receivedAt = metadata.receivedAt ?? now;
     if (this.disposed || metadata.stale || (metadata.epoch !== undefined && metadata.epoch !== this.observationEpoch)
       || !Number.isFinite(receivedAt) || receivedAt < this.lastContactAt || receivedAt > now
       || this.controlConnected === false || this.sensorConnected === false) {
-      return;
+      return false;
     }
     if (metadata.retained && (this.sensorFreshSinceOnline || this.activeRequest
       || this.estimate.kind === 'moving' || this.estimate.kind === 'stopped')) {
-      return;
+      return false;
     }
+    return true;
+  }
+
+  /** Return whether this sample became accepted contact evidence, including at debounce expiry. */
+  public handleClosedSensorChange(closed: boolean, metadata: ContactMetadata = {}): boolean {
+    if (!this.acceptsContact(metadata)) {
+      return false;
+    }
+    const now = this.clock.now();
+    const receivedAt = metadata.receivedAt ?? now;
     const previous = this.closedSensor;
     const wasFresh = this.sensorFreshSinceOnline;
     if (closed && previous === true && this.estimate.kind === 'moving' && this.estimate.direction === 'opening'
       && receivedAt - this.estimate.startedAt < this.timings.departureGraceMs) {
-      return;
+      return false;
     }
+    const request = this.activeRequest;
+    const waitingToLeaveClosed = previous === true && wasFresh && this.estimate.kind === 'closed'
+      && request?.target === 'open' && request.phase === 'waiting' && request.attempts === 0 && request.nextStep === 0
+      && request.plan.length === 1 && request.plan[0] === 'start-opening';
     this.closedSensor = closed;
     this.contactRevision += 1;
     this.lastContactAt = receivedAt;
     this.sensorFreshSinceOnline = true;
     if (closed) {
+      // Retention has no bounded measurement age. Debounce retains the original receive timestamp.
+      this.lastClosedAnchor = {
+        earliestAt: metadata.retained ? -Infinity : receivedAt - this.timings.sensorDelayMs, latestAt: receivedAt,
+      };
       this.setEstimate({ kind: 'closed', evidence: 'contact-confirmed' });
-      const target = this.activeRequest?.target;
-      this.finishRequest(target === 'closed' ? 'confirmed' : 'failed', target === 'closed' ? 'closed-contact' : 'target-mismatch-closed');
-      // CLOSED is a terminal barrier, including when OPEN was requested.
-      this.generation += 1;
+      if (!waitingToLeaveClosed) {
+        const target = request?.target;
+        this.finishRequest(target === 'closed' ? 'confirmed' : 'failed', target === 'closed' ? 'closed-contact' : 'target-mismatch-closed');
+        // A new closure or closure after an attempt is terminal, including when OPEN was requested.
+        this.generation += 1;
+      }
       this.emitSnapshot('closed-contact');
-      return;
+      return true;
     }
     if (wasFresh && previous === true && !metadata.retained) {
       if (this.estimate.kind === 'moving' && this.estimate.direction === 'opening') {
         this.setEstimate({ ...this.estimate, evidence: 'departure-observed' });
       } else if (this.estimate.kind === 'closed') {
-        this.lastPossibleActuationAt = now;
+        this.lastPossibleActuationAt = Math.max(this.lastPossibleActuationAt, receivedAt);
         this.finishRequest('cancelled', 'external-departure');
         const maximumDeparturePosition = Math.min(1,
           this.timings.sensorDelayMs / (this.timings.openingTravelMs * (1 - this.timings.travelUncertainty)),
@@ -239,13 +261,14 @@ export class FrontGateFsm {
       this.setEstimate(unknownEstimate());
     }
     this.emitSnapshot('not-closed-contact');
+    return true;
   }
 
   public handleCommandIntent(origin: 'external' | 'ambiguous', reason = 'mqtt-intent'): void {
     if (this.disposed) {
       return;
     }
-    this.lastPossibleActuationAt = this.clock.now();
+    this.lastPossibleActuationAt = Math.max(this.lastPossibleActuationAt, this.clock.now() + this.timings.actuationDelayMs);
     this.finishRequest('cancelled', `${origin}-${reason}`);
     this.generation += 1;
     this.setEstimate(unknownEstimate());
@@ -262,17 +285,31 @@ export class FrontGateFsm {
       return;
     }
     const now = this.clock.now();
-    if (correlationId && correlationId === this.lastLocalEffect?.correlationId) {
-      if (this.lastLocalEffect.observed || this.lastLocalEffect.generation !== this.generation) {
-        return;
-      }
-      if (occurredAt < this.lastLocalEffect.attemptedAt || occurredAt > this.lastLocalEffect.attemptedAt + this.timings.actuationDelayMs
-        || occurredAt > now || now - occurredAt > 250) {
-        this.handleObservationGap('own-relay-edge-outside-timing-window');
-        return;
-      }
-      this.lastLocalEffect.observed = true;
-      this.lastPossibleActuationAt = now;
+    const ownEffect = correlationId && correlationId === this.lastLocalEffect?.correlationId ? this.lastLocalEffect : undefined;
+    if (ownEffect && (ownEffect.observed || ownEffect.generation !== this.generation)) {
+      return;
+    }
+    if (!Number.isFinite(occurredAt) || occurredAt > now) {
+      this.handleObservationGap('invalid-relay-edge-time');
+      return;
+    }
+    if (ownEffect && (occurredAt < ownEffect.attemptedAt || occurredAt > ownEffect.attemptedAt + this.timings.actuationDelayMs
+      || now - occurredAt > 250)) {
+      this.handleObservationGap('own-relay-edge-outside-timing-window');
+      return;
+    }
+    if (this.lastClosedAnchor && occurredAt < this.lastClosedAnchor.earliestAt) {
+      // The anchor subsumes its state effect, but its relay-release interval can still constrain an unsent step.
+      this.lastPossibleActuationAt = Math.max(this.lastPossibleActuationAt, occurredAt);
+      return;
+    }
+    if (this.lastClosedAnchor && occurredAt < this.lastClosedAnchor.latestAt) {
+      this.handleObservationGap('relay-edge-overlaps-closed-contact');
+      return;
+    }
+    if (ownEffect) {
+      ownEffect.observed = true;
+      this.lastPossibleActuationAt = occurredAt;
       if (this.estimate.kind !== 'unknown' && this.estimate.kind !== 'closed') {
         this.setEstimate({ ...this.estimate, evidence: 'relay-observed' });
         this.emitSnapshot('own-relay-edge');
@@ -280,13 +317,13 @@ export class FrontGateFsm {
       return;
     }
     const previousPossibleActuationAt = this.lastPossibleActuationAt;
-    this.lastPossibleActuationAt = now;
+    this.lastPossibleActuationAt = Math.max(previousPossibleActuationAt, occurredAt);
     const inFlight = this.activeRequest?.phase === 'publishing';
     this.finishRequest('cancelled', 'external-relay-edge');
     this.generation += 1;
     const overlapsDeparture = this.estimate.kind === 'moving' && this.estimate.evidence === 'departure-observed'
       && occurredAt <= this.estimate.startedAt;
-    if (!this.isAvailable() || inFlight || occurredAt > now || now - occurredAt > 250
+    if (!this.isAvailable() || inFlight || now - occurredAt > 250
       || occurredAt < previousPossibleActuationAt || overlapsDeparture) {
       this.setEstimate(unknownEstimate());
     } else {
@@ -326,7 +363,7 @@ export class FrontGateFsm {
     const maximumTravel = Math.max(this.timings.openingTravelMs, this.timings.closingTravelMs) * (1 + this.timings.travelUncertainty);
     const deadline = this.clock.now() + maximumTravel + this.timings.actuationDelayMs
       + this.timings.sensorDelayMs + this.timings.sensorDebounceMs
-      + (plan.length + 1) * (this.pulseGapMs + this.timings.publishTimeoutMs);
+      + (plan.length + 1) * (this.timings.actuationDelayMs + this.pulseGapMs + this.timings.publishTimeoutMs);
     const request: ActiveRequest = {
       id, target, generation: ++this.generation, plan: Object.freeze([...plan]), attempts: 0, nextStep: 0, phase: 'waiting', deadline,
     };
@@ -357,13 +394,15 @@ export class FrontGateFsm {
       : estimate.kind === 'open' ? DoorCurrentState.OPEN
         : estimate.kind === 'moving' ? (estimate.direction === 'opening' ? DoorCurrentState.OPENING : DoorCurrentState.CLOSING)
           : DoorCurrentState.STOPPED;
+    const projectedTarget = estimate.kind === 'closed' || (estimate.kind === 'moving' && estimate.direction === 'closing')
+      ? 'closed' : 'open';
+    const target = request?.target ?? projectedTarget;
     return {
       available, transportConnected: this.transportConnected,
       controlConnected: this.controlConnected, sensorConnected: this.sensorConnected,
       closedSensor: this.closedSensor, sensorFreshSinceOnline: this.sensorFreshSinceOnline, observationEpoch: this.observationEpoch,
       currentDoorState: available ? current : undefined,
-      targetDoorState: available ? (request ? (request.target === 'closed' ? DoorTargetState.CLOSED : DoorTargetState.OPEN)
-        : estimate.kind === 'closed' ? DoorTargetState.CLOSED : DoorTargetState.OPEN) : undefined,
+      targetDoorState: available ? (target === 'closed' ? DoorTargetState.CLOSED : DoorTargetState.OPEN) : undefined,
       requestedTarget: request?.target ?? null,
       estimate: structuredClone(estimate), position: positionAt(estimate, this.clock.now(), this.timings),
       nextPulseDirection: estimate.kind === 'closed' ? 'opening' : estimate.kind === 'open' ? 'closing'
@@ -462,7 +501,8 @@ export class FrontGateFsm {
       correlationId: `${this.instanceId}:${request.generation}:${request.id}:${request.nextStep}`,
     };
     this.lastLocalEffect = { ...effect, attemptedAt: this.clock.now(), observed: false };
-    this.lastPossibleActuationAt = this.clock.now();
+    // Publication handling cannot timestamp the motor edge: reserve its entire possible delivery window.
+    this.lastPossibleActuationAt = this.clock.now() + this.timings.actuationDelayMs;
     this.setEstimate(applyEstimatedPulse(before, this.clock.now(), this.timings, 'attempted-unconfirmed'));
     this.io.log.info(`gate publication attempt ${JSON.stringify({ ...effect, step, pulseBudget: request.plan.length })}`);
     this.publishTimer = this.clock.setTimeout(() => {
@@ -535,6 +575,7 @@ export class FrontGateFsm {
     this.sensorFreshSinceOnline = false;
     this.closedSensor = null;
     this.lastContactAt = -Infinity;
+    this.lastClosedAnchor = undefined;
     this.setEstimate(unknownEstimate());
     this.emitSnapshot(reason);
   }

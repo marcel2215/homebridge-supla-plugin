@@ -10,7 +10,7 @@ Options:
   --tag <tag>        npm dist-tag to publish with (default: latest)
   --dry-run          Run npm publish in dry-run mode
   --allow-dirty      Allow publishing with uncommitted git changes
-  --skip-checks      Skip lint/build checks
+  --skip-checks      Skip preliminary lint/test checks (npm still runs prepublishOnly)
   --otp <code>       npm 2FA one-time password
   -h, --help         Show this help
 EOF
@@ -91,9 +91,9 @@ if ! npm whoami >/dev/null 2>&1; then
 fi
 
 if ! ${SKIP_CHECKS}; then
-  echo "Running pre-publish checks (lint + build)..."
+  echo "Running pre-publish checks (lint + tests)..."
   npm run lint
-  npm run build
+  npm test
 fi
 
 echo "Previewing package contents..."

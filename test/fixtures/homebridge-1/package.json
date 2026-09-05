@@ -1,0 +1,9 @@
+{
+  "name": "supla-homebridge-1-test-fixture",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Isolated Homebridge 1.6 dependency fixture for legacy plugin runtime tests",
+  "dependencies": {
+    "homebridge": "1.6.0"
+  }
+}

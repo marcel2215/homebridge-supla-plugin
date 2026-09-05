@@ -1,4 +1,4 @@
-name: Build and Lint
+name: Build, Lint and Test
 
 on: [push, pull_request]
 
@@ -9,30 +9,52 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # the Node.js versions to build on
-        node-version: [18.x, 20.x]
+        # The locked Homebridge 2 development dependency supports Node 22 and 24.
+        node-version: [22.x, 24.x]
 
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
 
-      - name: Use Node.js ${{ matrix.node-version }} 
-        uses: actions/setup-node@v3
+      - name: Use Node.js ${{ matrix.node-version }}
+        uses: actions/setup-node@v4
         with:
           node-version: ${{ matrix.node-version }}
+          cache: npm
 
       - name: Install dependencies
-        run: npm install
+        run: npm ci
 
       - name: Lint the project
         run: npm run lint
 
-      - name: Build the project
-        run: npm run build
+      - name: Build and run all tests
+        run: npm test
 
-      - name: List, audit, fix outdated dependencies and build again
-        run: |
-          npm list --outdated
-          npm audit || true  # ignore failures
-          npm audit fix || true
-          npm list --outdated
-          npm run build
+  homebridge-1-compatibility:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node-version: [18.17.0, 20.9.0]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install and compile with the supported development runtime
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22.x
+          cache: npm
+          cache-dependency-path: |
+            package-lock.json
+            test/fixtures/homebridge-1/package-lock.json
+      - run: npm ci
+      - run: npm run build
+      - name: Install the locked Homebridge 1.6 fixture
+        run: npm ci --prefix test/fixtures/homebridge-1
+      - name: Use the advertised legacy plugin runtime
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+      - name: Run all compiled tests with Homebridge 1 HAP
+        env:
+          SUPLA_TEST_HAP_PATH: ${{ github.workspace }}/test/fixtures/homebridge-1/node_modules/hap-nodejs
+        run: node --test test/*.test.js
