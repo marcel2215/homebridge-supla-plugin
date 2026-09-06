@@ -12,7 +12,7 @@ const { GateAccessory, parseGateBoolean } = require('../dist/Accesories/GateAcce
 const { NativeGateObserver } = require('../dist/Accesories/GateObservationSource');
 const { resolveFrontGateConfig, normalizeFrontGateTimings } = require('../dist/Accesories/FrontGateConfig');
 const { gateClock } = require('../dist/Accesories/FrontGateFsm');
-const { FakeClock } = require('./helpers/VirtualGate');
+const { FakeClock, VirtualGate } = require('./helpers/VirtualGate');
 
 const log = { debug() {}, info() {}, warn() {}, error() {} };
 const base = 'supla/test/devices/10/channels/20';
@@ -102,6 +102,167 @@ function fakeAccessoryClock(t) {
   t.mock.method(global, 'clearTimeout', timer => clock.clearTimeout(timer?.id ?? timer));
   return clock;
 }
+
+for (const [id, event] of [['S1a', 'mqtt'], ['S1b', 'gap'], ['S1c', 'applied-edge']]) {
+  test(`${id}: newer ${event} evidence prevents an older CLOSED debounce from restoring the anchor`, async t => {
+    const clock = fakeAccessoryClock(t);
+    const h = accessoryHarness(t, { options: { sensorDebounceMs: 200, sensorDelayMs: 0 } });
+    h.online();
+    h.contact(false);
+    await clock.tick(400);
+    h.contact(true);
+    await clock.tick(100);
+    if (event === 'mqtt') h.client.message(`${base}/execute_action`, 'open_close');
+    if (event === 'gap') h.adapter.fsm.handleObservationGap();
+    if (event === 'applied-edge') h.adapter.fsm.handleAppliedPulse(undefined, 500);
+    const pendingAfterEvent = h.adapter.pendingContact !== undefined;
+    await clock.tick(100);
+    assert.equal(h.adapter.fsm.getSnapshot().estimate.kind, 'unknown');
+    assert.equal(pendingAfterEvent, false, 'superseded debounce work should be cancelled immediately');
+    await assert.rejects(h.target.handleSetRequest(1));
+    await clock.tick(300000);
+    assert.equal(h.client.publications.length, 0);
+  });
+}
+
+async function secondReviewMotorScenario(t, sensorDelayMs, target) {
+  const clock = fakeAccessoryClock(t);
+  const h = accessoryHarness(t, { options: { sensorDebounceMs: 200, sensorDelayMs } });
+  const delivered = [];
+  const plant = new VirtualGate(clock, closed => {
+    clock.setTimeout(() => {
+      delivered.push({ closed, receivedAt: clock.now() });
+      h.contact(closed);
+    }, closed ? 0 : sensorDelayMs);
+  }, { relayHighMs: 500 });
+  // Startup condition: already closing, 400 ms from its endpoint. Every subsequent edge is reported.
+  plant.position = 400 / 25000;
+  plant.motion = 'closing';
+  plant.nextDirection = 'opening';
+  plant.lastClosed = false;
+  plant.endpointTimer = clock.setTimeout(() => plant.integrate(), 400);
+  h.client.message(`${base}/state/connected`, true);
+  h.client.message(`${sensorBase}/state/connected`, true);
+  h.contact(false);
+  h.client.onPublish = (_topic, _payload, callback) => { plant.pulse(); callback(); };
+  await clock.tick(400);
+  assert.equal(plant.state, 'closed');
+  await clock.tick(100);
+  h.client.message(`${base}/execute_action`, 'open_close');
+  plant.pulse(); // Immediate delivery, inside the default actuation-delay bound.
+  await clock.tick(200);
+  const accepted = await h.target.handleSetRequest(target).then(() => true, () => false);
+  const atRequest = h.adapter.fsm.getSnapshot();
+  await clock.tick(5300);
+  const at6000 = { publications: h.client.publications.length, physicalState: plant.state, position: plant.position };
+  await clock.tick(300000);
+  return { h, plant, delivered, accepted, atRequest, at6000 };
+}
+
+test('S1d: an obsolete CLOSED sample cannot authorize a pulse that stops an externally opening motor', async t => {
+  const scenario = await secondReviewMotorScenario(t, 6000, 0);
+  assert.equal(scenario.at6000.publications, 0, JSON.stringify(scenario.at6000));
+  assert.equal(scenario.at6000.physicalState, 'opening');
+  assert.ok(Math.abs(scenario.at6000.position - 0.22) < 1e-9);
+  assert.equal(scenario.accepted, false);
+  assert.equal(scenario.atRequest.lastResult.outcome, 'rejected');
+  assert.equal(scenario.plant.state, 'open');
+  assert.equal(scenario.h.client.publications.length, 0);
+  assert.deepEqual(scenario.delivered, [{ closed: true, receivedAt: 400 }, { closed: false, receivedAt: 6500 }]);
+});
+
+test('S1e: default sensor lag cannot falsely confirm CLOSE while an observed external command opens the motor', async t => {
+  const scenario = await secondReviewMotorScenario(t, 1000, 1);
+  assert.equal(scenario.accepted, false, JSON.stringify(scenario.atRequest.lastResult));
+  assert.equal(scenario.atRequest.lastResult.outcome, 'rejected');
+  assert.notEqual(scenario.atRequest.estimate.kind, 'closed');
+  assert.equal(scenario.plant.state, 'open');
+  assert.equal(scenario.h.client.publications.length, 0);
+  assert.deepEqual(scenario.delivered, [{ closed: true, receivedAt: 400 }, { closed: false, receivedAt: 1500 }]);
+});
+
+for (const kind of ['device-accepted', 'gap']) {
+  test(`S1 native ${kind}: superseded debounce is cancelled, while a later sustained CLOSED sample still repairs the estimate`, async t => {
+    const clock = fakeAccessoryClock(t);
+    const topic = 'gate-observer/10/20/events';
+    const h = accessoryHarness(t, { options: { observationTopic: topic, sensorDebounceMs: 200 } });
+    h.online();
+    h.contact(false);
+    await clock.tick(400);
+    h.contact(true);
+    await clock.tick(100);
+    h.client.message(topic, JSON.stringify({
+      version: 1, source: 'native-srpc', kind, deviceId: '10', channelId: '20', observedAt: Date.now(),
+    }));
+    assert.equal(h.adapter.pendingContact, undefined);
+    await clock.tick(200);
+    assert.equal(h.adapter.fsm.getSnapshot().estimate.kind, 'unknown');
+    h.contact(true);
+    await clock.tick(199);
+    await assert.rejects(h.target.handleSetRequest(1));
+    assert.equal(h.adapter.fsm.getSnapshot().estimate.kind, 'unknown');
+    await clock.tick(1);
+    assert.equal(h.adapter.fsm.getSnapshot().estimate.kind, 'closed');
+    assert.equal(h.adapter.fsm.getSnapshot().nextPulseDirection, 'opening');
+    assert.equal(h.client.publications.length, 0);
+  });
+}
+
+for (const source of ['mqtt', 'native']) {
+  test(`S1 control: ignored retained ${source} intent does not interrupt ordinary CLOSED debounce`, async t => {
+    const clock = fakeAccessoryClock(t);
+    const topic = 'gate-observer/10/20/events';
+    const h = accessoryHarness(t, { options: { observationTopic: topic, sensorDebounceMs: 200 } });
+    h.online();
+    h.contact(false);
+    await clock.tick(200);
+    h.contact(true);
+    await clock.tick(100);
+    if (source === 'mqtt') h.client.message(`${base}/execute_action`, 'open_close', { retain: true });
+    else h.client.message(topic, JSON.stringify({
+      version: 1, source: 'native-srpc', kind: 'device-accepted', deviceId: '10', channelId: '20', observedAt: Date.now(),
+    }), { retain: true });
+    await clock.tick(100);
+    assert.equal(h.adapter.fsm.getSnapshot().estimate.kind, 'closed');
+    assert.equal(h.client.publications.length, 0);
+  });
+}
+
+test('S1 queued callback: a cancelled observation cannot commit or erase a replacement debounce', async t => {
+  const clock = fakeAccessoryClock(t);
+  const h = accessoryHarness(t, { options: { sensorDebounceMs: 200 } });
+  h.online();
+  h.contact(false);
+  await clock.tick(200);
+  h.contact(true);
+  const alreadyQueued = clock.timers.get(h.adapter.debounceTimer.id).callback;
+  await clock.tick(100);
+  h.client.message(`${base}/execute_action`, 'open_close');
+  await clock.tick(50);
+  h.contact(true);
+  const replacement = h.adapter.pendingContact;
+  await clock.tick(50);
+  alreadyQueued();
+  assert.equal(h.adapter.pendingContact, replacement);
+  assert.equal(h.adapter.fsm.getSnapshot().estimate.kind, 'unknown');
+  await clock.tick(149);
+  await assert.rejects(h.target.handleSetRequest(1));
+  await clock.tick(1);
+  assert.equal(h.adapter.fsm.getSnapshot().estimate.kind, 'closed');
+  assert.equal(h.client.publications.length, 0);
+});
+
+test('S1 control: a live confirmation of an accepted retained baseline does not need a second debounce', async t => {
+  const clock = fakeAccessoryClock(t);
+  const h = accessoryHarness(t, { options: { sensorDebounceMs: 200 } });
+  h.online();
+  await clock.tick(200);
+  h.contact(true);
+  assert.equal(h.adapter.pendingContact, undefined);
+  await h.target.handleSetRequest(1);
+  assert.equal(h.adapter.fsm.getSnapshot().lastResult.outcome, 'confirmed');
+  assert.equal(h.client.publications.length, 0);
+});
 
 test('R3: ignored retained contact cannot bypass debounce and authorize OPEN on a brief spike', async t => {
   const clock = fakeAccessoryClock(t);

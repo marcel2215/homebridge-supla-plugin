@@ -67,6 +67,7 @@ export interface FrontGateSnapshot {
   closedSensor: boolean | null;
   sensorFreshSinceOnline: boolean;
   observationEpoch: number;
+  motionEvidenceRevision: number;
   currentDoorState?: DoorCurrentState;
   targetDoorState?: DoorTargetState;
   requestedTarget: GateTarget | null;
@@ -84,6 +85,8 @@ export interface ContactMetadata {
   // Monotonic receive time is not a measurement timestamp.
   receivedAt?: number;
   epoch?: number;
+  // Deferred callers must capture this at receipt, independently of request generation.
+  motionEvidenceRevision?: number;
   stale?: boolean;
 }
 export class GateNotSentError extends Error {}
@@ -99,6 +102,8 @@ export class FrontGateFsm {
   private closedSensor: boolean | null = null;
   private sensorFreshSinceOnline = false;
   private observationEpoch = 0;
+  private motionEvidenceRevision = 0;
+  private lastMotionEvidenceReceivedAt = -Infinity;
   private generation = 0;
   private nextRequestId = 0;
   private activeRequest?: ActiveRequest;
@@ -189,12 +194,23 @@ export class FrontGateFsm {
     }
   }
 
+  /** Capture before any debounce or asynchronous handoff; never stamp a delayed sample at commitment. */
+  public captureContactMetadata(retained = false): ContactMetadata {
+    return {
+      retained, receivedAt: this.clock.now(), epoch: this.observationEpoch, motionEvidenceRevision: this.motionEvidenceRevision,
+    };
+  }
+
   /** Shared, side-effect-free admission policy for receipt and delayed debounce commitment. */
   public acceptsContact(metadata: ContactMetadata = {}): boolean {
     const now = this.clock.now();
     const receivedAt = metadata.receivedAt ?? now;
     if (this.disposed || metadata.stale || (metadata.epoch !== undefined && metadata.epoch !== this.observationEpoch)
+      || (metadata.motionEvidenceRevision !== undefined && metadata.motionEvidenceRevision !== this.motionEvidenceRevision)
       || !Number.isFinite(receivedAt) || receivedAt < this.lastContactAt || receivedAt > now
+      || receivedAt < this.lastMotionEvidenceReceivedAt
+      || (metadata.receivedAt !== undefined && metadata.motionEvidenceRevision === undefined
+        && receivedAt === this.lastMotionEvidenceReceivedAt)
       || this.controlConnected === false || this.sensorConnected === false) {
       return false;
     }
@@ -268,6 +284,7 @@ export class FrontGateFsm {
     if (this.disposed) {
       return;
     }
+    this.advanceMotionEvidence(`${origin}-${reason}`);
     this.lastPossibleActuationAt = Math.max(this.lastPossibleActuationAt, this.clock.now() + this.timings.actuationDelayMs);
     this.finishRequest('cancelled', `${origin}-${reason}`);
     this.generation += 1;
@@ -307,13 +324,14 @@ export class FrontGateFsm {
       this.handleObservationGap('relay-edge-overlaps-closed-contact');
       return;
     }
+    this.advanceMotionEvidence(ownEffect ? 'own-relay-edge' : 'external-relay-edge');
     if (ownEffect) {
       ownEffect.observed = true;
       this.lastPossibleActuationAt = occurredAt;
       if (this.estimate.kind !== 'unknown' && this.estimate.kind !== 'closed') {
         this.setEstimate({ ...this.estimate, evidence: 'relay-observed' });
-        this.emitSnapshot('own-relay-edge');
       }
+      this.emitSnapshot('own-relay-edge');
       return;
     }
     const previousPossibleActuationAt = this.lastPossibleActuationAt;
@@ -401,6 +419,7 @@ export class FrontGateFsm {
       available, transportConnected: this.transportConnected,
       controlConnected: this.controlConnected, sensorConnected: this.sensorConnected,
       closedSensor: this.closedSensor, sensorFreshSinceOnline: this.sensorFreshSinceOnline, observationEpoch: this.observationEpoch,
+      motionEvidenceRevision: this.motionEvidenceRevision,
       currentDoorState: available ? current : undefined,
       targetDoorState: available ? (target === 'closed' ? DoorTargetState.CLOSED : DoorTargetState.OPEN) : undefined,
       requestedTarget: request?.target ?? null,
@@ -500,6 +519,7 @@ export class FrontGateFsm {
       requestId: request.id, stepId: request.nextStep, generation: request.generation,
       correlationId: `${this.instanceId}:${request.generation}:${request.id}:${request.nextStep}`,
     };
+    this.advanceMotionEvidence('local-publication-attempt');
     this.lastLocalEffect = { ...effect, attemptedAt: this.clock.now(), observed: false };
     // Publication handling cannot timestamp the motor edge: reserve its entire possible delivery window.
     this.lastPossibleActuationAt = this.clock.now() + this.timings.actuationDelayMs;
@@ -566,6 +586,12 @@ export class FrontGateFsm {
   private isAvailable(): boolean {
     return !this.disposed && this.transportConnected && this.controlConnected === true && this.sensorConnected === true
       && this.sensorFreshSinceOnline && this.closedSensor !== null;
+  }
+
+  private advanceMotionEvidence(reason: string): void {
+    this.motionEvidenceRevision += 1;
+    this.lastMotionEvidenceReceivedAt = this.clock.now();
+    this.io.log.debug(`gate pending contacts superseded by ${reason}; motion revision ${this.motionEvidenceRevision}`);
   }
 
   private loseObservations(reason: string): void {

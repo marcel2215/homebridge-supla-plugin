@@ -6,6 +6,8 @@ import { GateMqttTransport } from '../Heplers/GateMqttTransport';
 import { ContactMetadata, DoorTargetState, FrontGateFsm, FrontGateSnapshot, gateClock } from './FrontGateFsm';
 import { NativeGateObserver } from './GateObservationSource';
 
+type ContactObservation = { closed: boolean; metadata: ContactMetadata };
+
 export function parseGateBoolean(value: string): boolean | undefined {
   switch (value.trim().toLowerCase()) {
     case 'true': case '1': case 'on': case 'yes': return true;
@@ -19,8 +21,8 @@ export class GateAccessory {
   private readonly fsm: FrontGateFsm;
   private transport?: GateMqttTransport;
   private debounceTimer?: ReturnType<typeof setTimeout>;
-  private pendingContact?: boolean;
-  private lastContact?: boolean;
+  private pendingContact?: ContactObservation;
+  private lastContact?: ContactObservation;
   private lastLocalAttemptAt = -Infinity;
   private unsubscribe?: () => void;
   private reportingImmediate?: ReturnType<typeof setImmediate>;
@@ -179,9 +181,7 @@ export class GateAccessory {
   }
 
   private observeContact(closed: boolean | undefined, packet: IPublishPacket, debounceMs: number): void {
-    const metadata: ContactMetadata = {
-      retained: Boolean(packet.retain), receivedAt: gateClock.now(), epoch: this.fsm.getSnapshot().observationEpoch,
-    };
+    const metadata = this.fsm.captureContactMetadata(Boolean(packet.retain));
     if (!this.fsm.acceptsContact(metadata)) {
       return;
     }
@@ -191,25 +191,33 @@ export class GateAccessory {
       this.fsm.handleInvalidContact();
       return;
     }
-    if (this.pendingContact === closed) {
+    if (this.pendingContact?.closed === closed && this.fsm.acceptsContact(this.pendingContact.metadata)) {
       return;
     }
     this.clearDebounce();
-    if (closed === this.lastContact || debounceMs === 0) {
+    const observation = { closed, metadata };
+    const last = this.lastContact;
+    const unchanged = last?.closed === closed && last.metadata.epoch === metadata.epoch
+      && last.metadata.motionEvidenceRevision === metadata.motionEvidenceRevision;
+    if (unchanged || debounceMs === 0) {
       if (this.fsm.handleClosedSensorChange(closed, metadata)) {
-        this.lastContact = closed;
+        this.lastContact = observation;
       }
       return;
     }
     if (this.lastContact !== undefined && !metadata.retained) {
       this.fsm.handleContactTransition();
     }
-    this.pendingContact = closed;
+    this.pendingContact = observation;
     this.debounceTimer = setTimeout(() => {
+      // Even an already queued callback cannot clear or commit a replacement observation.
+      if (this.pendingContact !== observation) {
+        return;
+      }
       this.debounceTimer = undefined;
       this.pendingContact = undefined;
       if (!this.disposed && this.fsm.handleClosedSensorChange(closed, metadata)) {
-        this.lastContact = closed;
+        this.lastContact = observation;
       }
     }, debounceMs);
   }
@@ -226,6 +234,14 @@ export class GateAccessory {
     if (this.disposed) {
       return;
     }
+    // Covers MQTT intent, native acceptance/gaps, applied edges and local attempts through one boundary.
+    if (this.pendingContact && !this.contactMatchesSnapshot(this.pendingContact, snapshot)) {
+      this.clearDebounce();
+    }
+    if (this.lastContact && (!this.contactMatchesSnapshot(this.lastContact, snapshot)
+      || this.lastContact.closed !== snapshot.closedSensor)) {
+      this.lastContact = undefined;
+    }
     // Reporting never invokes the target SET handler. STOPPED also represents unknown motion.
     this.service.updateCharacteristic(this.platform.Characteristic.ObstructionDetected, false);
     if (!snapshot.available || snapshot.currentDoorState === undefined || snapshot.targetDoorState === undefined) {
@@ -235,6 +251,11 @@ export class GateAccessory {
     }
     this.service.updateCharacteristic(this.platform.Characteristic.CurrentDoorState, snapshot.currentDoorState);
     this.service.updateCharacteristic(this.platform.Characteristic.TargetDoorState, snapshot.targetDoorState);
+  }
+
+  private contactMatchesSnapshot(observation: ContactObservation, snapshot: FrontGateSnapshot): boolean {
+    return observation.metadata.epoch === snapshot.observationEpoch
+      && observation.metadata.motionEvidenceRevision === snapshot.motionEvidenceRevision;
   }
 
   private createCommunicationError(): Error {
